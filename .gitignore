@@ -1,0 +1,72 @@
+# Media files - exclude all video/audio content
+*.mp4
+*.mkv
+*.avi
+*.mov
+*.flv
+*.m4v
+*.wmv
+*.mp3
+*.wav
+*.flac
+*.aac
+*.ogg
+
+# Subtitle files
+*.srt
+*.vtt
+*.ass
+*.ssa
+*.sub
+*.idx
+
+# Image files
+*.jpg
+*.jpeg
+*.png
+*.gif
+*.bmp
+*.tiff
+
+# Media directories - exclude entire content folders
+Movies/
+TV/
+Kids Movies/
+Christmas/
+Music Videos/
+Personal/
+HalloweenFX/
+Misc/
+
+# System files
+.DS_Store
+Thumbs.db
+desktop.ini
+._*
+
+# Temporary files
+*_temp.*
+*-CONVERTED.*
+temp_*.py
+
+# Large reports and logs
+*.log
+analysis_report_*.json
+video_inventory_*.txt
+integrity_check_*.txt
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.so
+
+# Virtual environment
+convert_env/
+venv/
+env/
+
+# External tools
+PlexDBRepair-master/
