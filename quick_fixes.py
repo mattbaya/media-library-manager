@@ -156,7 +156,33 @@ def fix_naming_issues(base_path):
     return fixed
 
 if __name__ == "__main__":
-    base_path = "/Volumes/media/Video"
+    import sys
+    
+    # Default path
+    default_path = "/Volumes/media/Video"
+    
+    # Accept command line argument or use default
+    if len(sys.argv) > 1:
+        base_path = sys.argv[1]
+        
+        # Validate the provided path
+        if not os.path.exists(base_path):
+            print(f"Error: Directory {base_path} does not exist")
+            sys.exit(1)
+        
+        if not os.path.isdir(base_path):
+            print(f"Error: {base_path} is not a directory")
+            sys.exit(1)
+        
+        # Basic security check - prevent operations on system directories
+        dangerous_paths = ['/', '/etc', '/usr', '/bin', '/sbin', '/System', '/Library']
+        real_path = os.path.realpath(base_path)
+        if any(real_path.startswith(danger) for danger in dangerous_paths):
+            print(f"Error: Cannot operate on system directory {real_path}")
+            sys.exit(1)
+            
+    else:
+        base_path = default_path
     
     print("="*60)
     print("🔧 Running Quick Fixes")
