@@ -41,6 +41,24 @@ def main():
     print("🔧 Targeted Cleanup")
     print("="*60)
     
+    print(f"This will clean system files from {base_path} and subdirectories:")
+    print("  • Remove .DS_Store, Thumbs.db, desktop.ini files")
+    print("  • Remove ._ resource fork files")
+    print("  • Identify files with '-CONVERTED' suffix (won't delete)")
+    print()
+    
+    # Require explicit user consent before destructive operations
+    try:
+        response = input("This will delete system files. Continue? (y/N): ").strip().lower()
+        if response != 'y':
+            print("❌ Operation cancelled by user")
+            sys.exit(0)
+    except (EOFError, KeyboardInterrupt):
+        print("\n❌ Operation cancelled")
+        sys.exit(0)
+    
+    print("\n✅ User confirmed - proceeding with cleanup...")
+    
     # Clean main directories
     main_dirs = ['Movies', 'TV', 'Kids Movies', 'Christmas', 'Music Videos', 'Personal', 'HalloweenFX', 'Misc']
     
