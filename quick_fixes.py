@@ -188,6 +188,25 @@ if __name__ == "__main__":
     print("🔧 Running Quick Fixes")
     print("="*60)
     
+    print(f"This will perform the following operations on {base_path}:")
+    print("  • Remove system files (.DS_Store, Thumbs.db, etc.)")
+    print("  • Remove empty directories")
+    print("  • Remove small sample/trailer videos (<100MB)")
+    print("  • Fix common filename issues (spaces, punctuation)")
+    print()
+    
+    # Require explicit user consent before destructive operations
+    try:
+        response = input("These operations will modify/delete files. Continue? (y/N): ").strip().lower()
+        if response != 'y':
+            print("❌ Operation cancelled by user")
+            sys.exit(0)
+    except (EOFError, KeyboardInterrupt):
+        print("\n❌ Operation cancelled")
+        sys.exit(0)
+    
+    print("\n✅ User confirmed - proceeding with quick fixes...")
+    
     # Run all quick fixes
     system_files_removed = remove_system_files(base_path)
     empty_folders_removed = clean_empty_folders(base_path)
