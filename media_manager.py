@@ -559,6 +559,33 @@ class MediaManager:
         
         return cleaned_codec
     
+    def validate_python_executable(self, python_path):
+        """Validate that a path points to a legitimate Python executable."""
+        try:
+            # Check if it's a regular file (not a symlink that could be manipulated)
+            if not os.path.isfile(python_path) or os.path.islink(python_path):
+                return False
+            
+            # Check file permissions - should not be writable by others
+            stat_info = os.stat(python_path)
+            if stat_info.st_mode & 0o022:  # Check if writable by group or others
+                self.security_audit_log("PYTHON_INSECURE_PERMS", f"Python executable has insecure permissions: {python_path}")
+                return False
+            
+            # Try to execute it with a simple test to ensure it's actually Python
+            result = subprocess.run([python_path, '-c', 'import sys; print(sys.version_info.major)'], 
+                                  capture_output=True, text=True, timeout=5)
+            
+            if result.returncode == 0 and result.stdout.strip() == '3':
+                return True
+            else:
+                self.security_audit_log("PYTHON_INVALID", f"Path does not execute as Python 3: {python_path}")
+                return False
+                
+        except (OSError, subprocess.SubprocessError, subprocess.TimeoutExpired) as e:
+            self.security_audit_log("PYTHON_VALIDATION_ERROR", f"Error validating Python executable {python_path}: {e}")
+            return False
+    
     def graceful_shutdown(self, signum, frame):
         """Handle shutdown signals gracefully."""
         print("\n🛑 Received shutdown signal. Exiting safely...")
@@ -835,19 +862,19 @@ class MediaManager:
         except (subprocess.SubprocessError, FileNotFoundError, subprocess.TimeoutExpired):
             missing_deps.append("FFprobe")
         
-        # Check Python virtual environment (configurable via environment variable)
-        python_env_path = os.environ.get('MEDIA_MANAGER_PYTHON_ENV', 
-                                        os.path.join(self.base_path, "convert_env", "bin", "python"))
+        # Use only secure Python executable paths - SECURITY: Removed environment variable override
+        # to prevent arbitrary code execution through malicious Python interpreters
+        default_venv_path = os.path.join(self.base_path, "convert_env", "bin", "python")
         
-        # Validate the Python environment path is safe
-        if not self.validate_safe_path(python_env_path):
-            print(f"Warning: Python environment path is unsafe: {self.sanitize_path_for_display(python_env_path)}")
-            python_env_path = sys.executable  # Fallback to current Python
-        elif not os.path.exists(python_env_path):
-            print(f"Warning: Python virtual environment not found at {python_env_path}")
-            python_env_path = sys.executable  # Fallback to current Python
-        
-        self.python_executable = python_env_path
+        # Try to use virtual environment if it exists and is safe, otherwise use current interpreter
+        if (os.path.exists(default_venv_path) and 
+            self.validate_safe_path(default_venv_path) and
+            self.validate_python_executable(default_venv_path)):
+            self.python_executable = default_venv_path
+            self.security_audit_log("PYTHON_ENV_SELECTED", f"Using venv: {default_venv_path}")
+        else:
+            self.python_executable = sys.executable  # Use current secure Python interpreter
+            self.security_audit_log("PYTHON_ENV_FALLBACK", f"Using system Python: {sys.executable}")
         
         # Check optional dependencies
         self.optional_deps = {}
