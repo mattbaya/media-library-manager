@@ -5680,7 +5680,8 @@ class MediaManager:
                 print("  macOS: brew install rclone")
                 print("  Ubuntu/Debian: apt install rclone")
                 print("  RHEL/CentOS: yum install rclone") 
-                print("  Manual: Download from https://rclone.org/downloads/")
+                print("  Manual: Visit official rclone website for secure downloads")
+                print("         Verify GPG signatures and checksums before installation")
                 self.safe_input("\nPress Enter to continue...")
                 return
             
