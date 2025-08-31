@@ -534,6 +534,31 @@ class MediaManager:
         
         return True, "Remote name is safe"
     
+    def validate_codec_name(self, codec_name):
+        """Validate codec name from video metadata to prevent injection."""
+        if not codec_name:
+            return "unknown"
+        
+        # Convert to string and limit length
+        codec_str = str(codec_name)[:50]  # Limit length to prevent DoS
+        
+        # Remove any dangerous characters that could be used for injection
+        import re
+        # Only allow alphanumeric characters, dots, dashes, and underscores
+        cleaned_codec = re.sub(r'[^a-zA-Z0-9._-]', '', codec_str.lower())
+        
+        # If the cleaned codec is empty, return unknown
+        if not cleaned_codec:
+            return "unknown"
+        
+        # Check for suspicious patterns that could indicate injection attempts
+        suspicious_patterns = ['select', 'insert', 'update', 'delete', 'drop', 'union', 'or', 'and', '--', ';']
+        if any(pattern in cleaned_codec.lower() for pattern in suspicious_patterns):
+            self.security_audit_log("CODEC_INJECTION_ATTEMPT", f"Suspicious codec name: {codec_name}")
+            return "suspicious"
+        
+        return cleaned_codec
+    
     def graceful_shutdown(self, signum, frame):
         """Handle shutdown signals gracefully."""
         print("\n🛑 Received shutdown signal. Exiting safely...")
@@ -5196,7 +5221,7 @@ class MediaManager:
                         if stream.get('codec_type') == 'video':
                             width = stream.get('width', 0)
                             height = stream.get('height', 0)
-                            codec = stream.get('codec_name', 'unknown')
+                            codec = self.validate_codec_name(stream.get('codec_name', 'unknown'))
                             duration = float(stream.get('duration', 0))
                             bitrate = int(stream.get('bit_rate', 0)) if stream.get('bit_rate') else None
                             
@@ -5604,8 +5629,10 @@ class MediaManager:
             for row in cursor.fetchall():
                 results['missing_subtitles'].append(row['file_path'])
             
-            # Get codec issues
-            cursor.execute("SELECT * FROM video_files WHERE codec IN ('mpeg4', 'xvid', 'divx', 'wmv3')")
+            # Get codec issues - use parameterized query for security
+            problematic_codecs = ('mpeg4', 'xvid', 'divx', 'wmv3')
+            placeholders = ','.join('?' * len(problematic_codecs))
+            cursor.execute(f"SELECT * FROM video_files WHERE codec IN ({placeholders})", problematic_codecs)
             for row in cursor.fetchall():
                 results['codec_issues'].append({
                     'path': row['file_path'],
