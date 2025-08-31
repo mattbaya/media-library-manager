@@ -806,7 +806,7 @@ class MediaManager:
         ]
         
         try:
-            result = subprocess.run(cmd, timeout=TimeoutConstants.LONG)  # 1 hour timeout
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=TimeoutConstants.LONG)  # 1 hour timeout
             return result.returncode == 0
         except (subprocess.SubprocessError, subprocess.TimeoutExpired):
             return False
@@ -1853,7 +1853,7 @@ class MediaManager:
             output_file
         ]
         
-        result = subprocess.run(cmd, timeout=TimeoutConstants.LONG)  # 1 hour timeout
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=TimeoutConstants.LONG)  # 1 hour timeout
         if result.returncode != 0:
             print("✗ Conversion failed!")
             # Clean up temporary file on failure
@@ -3431,10 +3431,18 @@ class MediaManager:
         """Show current storage usage overview."""
         print("\nAnalyzing storage usage...")
         
-        # Get disk usage
+        # Get disk usage with symlink protection
         import shutil
         
-        total, used, free = shutil.disk_usage(self.base_path)
+        # Resolve symlinks to prevent TOCTOU attacks
+        real_path = os.path.realpath(self.base_path)
+        
+        # Validate the resolved path is still safe
+        if not real_path.startswith('/Volumes/media/'):
+            print("Error: Disk space check blocked - potential symlink attack")
+            return
+        
+        total, used, free = shutil.disk_usage(real_path)
         
         # Calculate usage by category
         categories = {
@@ -3598,8 +3606,16 @@ class MediaManager:
         import shutil
         from collections import defaultdict
         
-        # Get current disk usage
-        total, used, free = shutil.disk_usage(self.base_path)
+        # Get current disk usage with symlink protection
+        # Resolve symlinks to prevent TOCTOU attacks
+        real_path = os.path.realpath(self.base_path)
+        
+        # Validate the resolved path is still safe
+        if not real_path.startswith('/Volumes/media/'):
+            print("Error: Disk space check blocked - potential symlink attack")
+            return
+        
+        total, used, free = shutil.disk_usage(real_path)
         
         # Analyze growth over last 6 months
         monthly_sizes = defaultdict(int)
@@ -3888,8 +3904,16 @@ class MediaManager:
         import json
         import shutil
         
-        # Gather all data
-        total, used, free = shutil.disk_usage(self.base_path)
+        # Gather all data with symlink protection
+        # Resolve symlinks to prevent TOCTOU attacks
+        real_path = os.path.realpath(self.base_path)
+        
+        # Validate the resolved path is still safe
+        if not real_path.startswith('/Volumes/media/'):
+            print("Error: Disk space check blocked - potential symlink attack")
+            return
+        
+        total, used, free = shutil.disk_usage(real_path)
         
         report_data = {
             'generated': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
@@ -4990,6 +5014,9 @@ class MediaManager:
             # Get cached data for unchanged files
             unchanged_files = [f for f in all_video_files if f not in files_to_analyze]
             for file_path in unchanged_files:
+                # Validate file path before database query
+                if not self.validate_safe_path(file_path):
+                    continue
                 cursor.execute('SELECT * FROM video_files WHERE file_path = ?', (file_path,))
                 row = cursor.fetchone()
                 if row:
@@ -5737,8 +5764,18 @@ class MediaManager:
         
         # Execute sync
         for dir_name in selected_dirs:
+            # Validate directory name to prevent command injection
+            if dir_name.startswith('-') or '--' in dir_name:
+                print(f"✗ Skipping directory with unsafe name: {self.sanitize_path_for_display(dir_name)}")
+                continue
+                
             source_path = os.path.join(self.base_path, dir_name)
             remote_path = f"{selected_remote}:Media/{dir_name}"
+            
+            # Validate paths are safe
+            if not self.validate_safe_path(source_path):
+                print(f"✗ Skipping unsafe source path: {self.sanitize_path_for_display(dir_name)}")
+                continue
             
             print(f"\n🚀 {sync_cmd.title()}ing {dir_name}...")
             
@@ -5865,7 +5902,7 @@ class MediaManager:
         print(f"💡 Press Ctrl+C to safely stop the backup\n")
         
         try:
-            result = subprocess.run(cmd, text=True)
+            result = subprocess.run(cmd, capture_output=True, text=True)
             if result.returncode == 0:
                 print(f"\n✅ Backup completed successfully!")
             else:
@@ -5940,8 +5977,18 @@ class MediaManager:
                 
                 # Execute download
                 for dir_name in selected_dirs:
+                    # Validate directory name to prevent command injection
+                    if dir_name.startswith('-') or '--' in dir_name:
+                        print(f"✗ Skipping directory with unsafe name: {self.sanitize_path_for_display(dir_name)}")
+                        continue
+                        
                     remote_path = f"{selected_remote}:{dir_name}"
                     local_path = os.path.join(self.base_path, dir_name)
+                    
+                    # Validate local path is safe
+                    if not self.validate_safe_path(local_path):
+                        print(f"✗ Skipping unsafe local path: {self.sanitize_path_for_display(dir_name)}")
+                        continue
                     
                     print(f"\n📥 Downloading {dir_name}...")
                     
@@ -6118,7 +6165,7 @@ class MediaManager:
         print(f"\n🚀 Starting integrity check...")
         
         try:
-            result = subprocess.run(cmd, text=True)
+            result = subprocess.run(cmd, capture_output=True, text=True)
             if result.returncode == 0:
                 print("✅ All files verified successfully!")
             else:
