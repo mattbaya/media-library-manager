@@ -63,13 +63,30 @@ def process_directory(directory):
 
                 if needs_conversion:
                     output_file = os.path.splitext(file_path)[0] + ".mp4"
-                    print(f"Converting {file_path} to 1080p due to resolution/size criteria...")
+                    
+                    # Require explicit user consent before destructive operations
+                    print(f"\n🚨 CONVERSION REQUIRED:")
+                    print(f"   File: {os.path.basename(file_path)}")
+                    print(f"   Current: {width}x{height} ({file_size_gb:.2f} GB)")
+                    print(f"   Target: 1920x1080 (reduced size)")
+                    print(f"   This will create a new file and rename the original.")
+                    
+                    try:
+                        response = input(f"\nConvert this file? (y/N): ").strip().lower()
+                        if response != 'y':
+                            print("❌ Conversion skipped by user")
+                            continue
+                    except (EOFError, KeyboardInterrupt):
+                        print("\n❌ Conversion cancelled by user")
+                        break
+                    
+                    print(f"✅ User confirmed - Converting {file_path} to 1080p...")
                     convert_to_1080p(file_path, output_file)
 
-                    # Rename original file
+                    # Rename original file with user consent already obtained
                     converted_filename = f"{os.path.splitext(file_path)[0]}-CONVERTED{os.path.splitext(file_path)[1]}"
                     os.rename(file_path, converted_filename)
-                    print(f"Original file renamed to {converted_filename}")
+                    print(f"✅ Original file renamed to {os.path.basename(converted_filename)}")
                 else:
                     print(f"No conversion needed for {file_path}")
 
