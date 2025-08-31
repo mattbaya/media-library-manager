@@ -128,6 +128,7 @@ class MediaManager:
         # Resource limits to prevent exhaustion
         self.max_files_per_scan = 100000  # Limit file scanning
         self.max_directory_depth = 20  # Prevent deep recursion
+        self.max_path_length = 4096      # Prevent path length attacks
         self.files_scanned_count = 0
         
         # Signal handling for graceful shutdown
@@ -489,6 +490,50 @@ class MediaManager:
         
         return cleaned
     
+    def validate_rclone_remote_name(self, remote_name):
+        """Validate rclone remote name to prevent command injection."""
+        if not remote_name:
+            return False, "Remote name cannot be empty"
+        
+        # Check for shell metacharacters that could lead to command injection
+        dangerous_chars = [
+            ';', '&', '|', '$', '`', '\n', '\r', '\t',
+            '(', ')', '{', '}', '[', ']', '<', '>', 
+            '"', "'", '\\', '!', '*', '?', '~',
+            '\x00', '\x1a', '\x1b'  # Null and escape chars
+        ]
+        
+        for char in dangerous_chars:
+            if char in remote_name:
+                self.security_audit_log("RCLONE_INJECTION_ATTEMPT", f"Dangerous character '{char}' in remote: {remote_name}")
+                return False, f"Remote name contains dangerous character: {repr(char)}"
+        
+        # Check for command substitution patterns
+        dangerous_patterns = [
+            '$(', '${', '`', '<(', '>(', 
+            '&&', '||', ';;', '|&',
+            '../', '..\\', './/', '.\\\\',
+            'cmd.exe', '/bin/sh', '/bin/bash'
+        ]
+        
+        for pattern in dangerous_patterns:
+            if pattern in remote_name.lower():
+                self.security_audit_log("RCLONE_INJECTION_ATTEMPT", f"Dangerous pattern '{pattern}' in remote: {remote_name}")
+                return False, f"Remote name contains dangerous pattern: {pattern}"
+        
+        # Validate remote name format (alphanumeric, dash, underscore only)
+        # This is the safest approach - whitelist allowed characters
+        import re
+        if not re.match(r'^[a-zA-Z0-9_-]+$', remote_name):
+            self.security_audit_log("RCLONE_INVALID_REMOTE", f"Invalid characters in remote: {remote_name}")
+            return False, "Remote name can only contain letters, numbers, dash, and underscore"
+        
+        # Check length limits
+        if len(remote_name) > 64:
+            return False, "Remote name too long (max 64 characters)"
+        
+        return True, "Remote name is safe"
+    
     def graceful_shutdown(self, signum, frame):
         """Handle shutdown signals gracefully."""
         print("\n🛑 Received shutdown signal. Exiting safely...")
@@ -548,6 +593,12 @@ class MediaManager:
                     print(f"Warning: Maximum directory depth ({self.max_directory_depth}) exceeded. Skipping: {root}")
                     dirs.clear()  # Don't recurse further
                     continue
+                
+                # Check path length to prevent path length attacks
+                if len(root) > self.max_path_length:
+                    print(f"Warning: Path length ({len(root)}) exceeds maximum ({self.max_path_length}). Skipping: {root[:100]}...")
+                    dirs.clear()  # Don't recurse further
+                    continue
                 # Validate each subdirectory is safe
                 if not self.validate_safe_path(root):
                     print(f"Warning: Skipping unsafe subdirectory: {root}")
@@ -565,6 +616,11 @@ class MediaManager:
                         
                         if normalized_file.lower().endswith(self.video_extensions):
                             file_path = os.path.join(root, normalized_file)
+                            
+                            # Check total file path length
+                            if len(file_path) > self.max_path_length:
+                                print(f"Warning: File path length ({len(file_path)}) exceeds maximum. Skipping: {file_path[:100]}...")
+                                continue
                             
                             # Double-check the final path is safe
                             if self.validate_safe_path(file_path):
@@ -5787,6 +5843,14 @@ class MediaManager:
             input("Press Enter to continue...")
             return
         
+        # Validate remote name to prevent command injection
+        is_safe, message = self.validate_rclone_remote_name(selected_remote)
+        if not is_safe:
+            print(f"❌ Security Error: {message}")
+            self.security_audit_log("RCLONE_UNSAFE_REMOTE", f"Rejected remote: {selected_remote}")
+            input("Press Enter to continue...")
+            return
+        
         # Sync options
         print(f"\nSync options:")
         print("1. Copy only (upload new/changed files)")
@@ -5907,6 +5971,14 @@ class MediaManager:
             input("Press Enter to continue...")
             return
         
+        # Validate remote name to prevent command injection
+        is_safe, message = self.validate_rclone_remote_name(selected_remote)
+        if not is_safe:
+            print(f"❌ Security Error: {message}")
+            self.security_audit_log("RCLONE_UNSAFE_REMOTE", f"Rejected remote: {selected_remote}")
+            input("Press Enter to continue...")
+            return
+        
         # Backup options
         print(f"\nBackup options:")
         print("1. Incremental backup (copy new/changed files only)")
@@ -5993,6 +6065,14 @@ class MediaManager:
             selected_remote = remotes[int(remote_choice) - 1]
         except (ValueError, IndexError):
             print("Invalid selection.")
+            input("Press Enter to continue...")
+            return
+        
+        # Validate remote name to prevent command injection
+        is_safe, message = self.validate_rclone_remote_name(selected_remote)
+        if not is_safe:
+            print(f"❌ Security Error: {message}")
+            self.security_audit_log("RCLONE_UNSAFE_REMOTE", f"Rejected remote: {selected_remote}")
             input("Press Enter to continue...")
             return
         
@@ -6107,6 +6187,14 @@ class MediaManager:
             input("Press Enter to continue...")
             return
         
+        # Validate remote name to prevent command injection
+        is_safe, message = self.validate_rclone_remote_name(selected_remote)
+        if not is_safe:
+            print(f"❌ Security Error: {message}")
+            self.security_audit_log("RCLONE_UNSAFE_REMOTE", f"Rejected remote: {selected_remote}")
+            input("Press Enter to continue...")
+            return
+        
         print(f"\n🔍 Checking sync status with {selected_remote}...")
         
         # Check what needs to be synced
@@ -6206,6 +6294,14 @@ class MediaManager:
             selected_remote = remotes[int(remote_choice) - 1]
         except (ValueError, IndexError):
             print("Invalid selection.")
+            input("Press Enter to continue...")
+            return
+        
+        # Validate remote name to prevent command injection
+        is_safe, message = self.validate_rclone_remote_name(selected_remote)
+        if not is_safe:
+            print(f"❌ Security Error: {message}")
+            self.security_audit_log("RCLONE_UNSAFE_REMOTE", f"Rejected remote: {selected_remote}")
             input("Press Enter to continue...")
             return
         
