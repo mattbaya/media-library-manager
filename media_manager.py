@@ -11,131 +11,968 @@ import threading
 import time
 import sqlite3
 import hashlib
+import queue
+import unicodedata
+import random
+import signal
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
+# Safe file size constants to prevent integer overflow
+class FileSizeConstants:
+    KB = 1024
+    MB = KB * KB  # 1,048,576
+    GB = MB * KB  # 1,073,741,824
+    TB = GB * KB  # 1,099,511,627,776
+    
+    # Safe thresholds (well below max int values)
+    MAX_FILE_SIZE = 100 * GB  # 100GB max
+    LARGE_FILE_THRESHOLD = 5 * GB
+    HUGE_FILE_THRESHOLD = 10 * GB
+    SAMPLE_FILE_MAX = 100 * MB
+
+# Standardized timeout constants to prevent DoS attacks
+class TimeoutConstants:
+    # Quick operations (version checks, simple commands)
+    QUICK = 5
+    
+    # Standard operations (file analysis, queries)
+    STANDARD = 30
+    
+    # Medium operations (file conversions, downloads)
+    MEDIUM = 300  # 5 minutes
+    
+    # Long operations (large file processing, backups)
+    LONG = 3600  # 1 hour
+    
+    # Database connections
+    DATABASE = 30.0
+
+class DatabaseContext:
+    """Context manager for safe database connections with automatic cleanup."""
+    
+    def __init__(self, db_path):
+        self.db_path = db_path
+        self.conn = None
+    
+    def __enter__(self):
+        self.conn = sqlite3.connect(self.db_path, timeout=TimeoutConstants.DATABASE)
+        self.conn.row_factory = sqlite3.Row
+        # Enable WAL mode for better concurrent access
+        self.conn.execute('PRAGMA journal_mode=WAL')
+        return self.conn
+    
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        if self.conn:
+            if exc_type is None:
+                self.conn.commit()
+            else:
+                self.conn.rollback()
+            self.conn.close()
+        return False
 
 class MediaManager:
     def __init__(self, base_path="/Volumes/media/Video"):
-        self.base_path = base_path
+        # Validate and normalize base path
+        self.base_path = os.path.abspath(os.path.realpath(base_path))
+        
+        # Ensure base_path exists and is accessible
+        if not os.path.exists(self.base_path):
+            raise ValueError(f"Base path does not exist: {self.base_path}")
+        if not os.path.isdir(self.base_path):
+            raise ValueError(f"Base path is not a directory: {self.base_path}")
+        if not os.access(self.base_path, os.R_OK):
+            raise ValueError(f"Base path is not readable: {self.base_path}")
+        
         self.video_extensions = ('.mp4', '.mkv', '.avi', '.mov', '.flv', '.m4v', '.wmv')
-        self.db_path = os.path.join(base_path, 'media_library.db')
+        self.db_path = os.path.join(self.base_path, 'media_library.db')
+        
+        # Check dependencies at startup
+        self.check_dependencies()
+        
         self.init_database()
         
+        # Background task management with thread safety
+        self.task_queue = queue.Queue()
+        self.active_tasks = {}
+        self.completed_tasks = []
+        self.task_counter = 0
+        self.max_concurrent_tasks = 2
+        self._task_lock = threading.Lock()
+        self._progress_lock = threading.Lock()
+        
+        # Resource limits to prevent exhaustion
+        self.max_files_per_scan = 100000  # Limit file scanning
+        self.max_directory_depth = 20  # Prevent deep recursion
+        self.files_scanned_count = 0
+        
+        # Signal handling for graceful shutdown
+        self._shutdown_requested = False
+        signal.signal(signal.SIGINT, self._signal_handler)
+        signal.signal(signal.SIGTERM, self._signal_handler)
+        
+        # Rate limiting and DoS protection
+        self.rate_limit_window = 60  # 1 minute window
+        self.max_operations_per_minute = 30  # Limit operations per minute
+        self.operation_timestamps = []
+        self.failed_operation_count = 0
+        self.max_failed_operations = 10  # Lock after 10 failed operations
+        self._rate_limit_lock = threading.Lock()
+        
     def init_database(self):
-        """Initialize SQLite database for video metadata caching."""
-        conn = sqlite3.connect(self.db_path)
-        cursor = conn.cursor()
+        """Initialize SQLite database for video metadata caching with security hardening."""
+        with self.get_db_context() as conn:
+            cursor = conn.cursor()
+            
+            # Apply comprehensive security hardening PRAGMAs
+            cursor.execute('PRAGMA journal_mode = WAL')  # Write-Ahead Logging for better concurrency
+            cursor.execute('PRAGMA synchronous = FULL')  # Maximum data integrity
+            cursor.execute('PRAGMA foreign_keys = ON')   # Enable foreign key constraints
+            cursor.execute('PRAGMA secure_delete = ON')  # Overwrite deleted data
+            cursor.execute('PRAGMA temp_store = MEMORY') # Store temp data in memory, not disk
+            cursor.execute('PRAGMA cell_size_check = ON')  # Enable database consistency checks
+            cursor.execute('PRAGMA trusted_schema = OFF')  # Disable trusted schema for security
+            cursor.execute('PRAGMA auto_vacuum = FULL')    # Automatic database maintenance
+            
+            # Create main video files table
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS video_files (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    file_path TEXT UNIQUE NOT NULL,
+                    relative_path TEXT NOT NULL,
+                    filename TEXT NOT NULL,
+                    file_size INTEGER NOT NULL,
+                    file_modified REAL NOT NULL,
+                    last_scanned REAL NOT NULL,
+                    width INTEGER,
+                    height INTEGER,
+                    duration REAL,
+                    codec TEXT,
+                    bitrate INTEGER,
+                    framerate REAL,
+                    has_external_subs BOOLEAN DEFAULT 0,
+                    has_embedded_subs BOOLEAN DEFAULT 0,
+                    subtitle_languages TEXT,
+                    naming_issues TEXT,
+                    needs_conversion BOOLEAN DEFAULT 0,
+                    conversion_reason TEXT,
+                    checksum TEXT
+                )
+            ''')
+            
+            # Create analysis sessions table
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS analysis_sessions (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    timestamp REAL NOT NULL,
+                    total_files INTEGER NOT NULL,
+                    files_analyzed INTEGER NOT NULL,
+                    duration_seconds REAL,
+                    recommendations TEXT,
+                    status TEXT DEFAULT 'completed'
+                )
+            ''')
+            
+            # Create indexes for performance
+            cursor.execute('CREATE INDEX IF NOT EXISTS idx_file_path ON video_files(file_path)')
+            cursor.execute('CREATE INDEX IF NOT EXISTS idx_file_modified ON video_files(file_modified)')
+            cursor.execute('CREATE INDEX IF NOT EXISTS idx_needs_conversion ON video_files(needs_conversion)')
+            cursor.execute('CREATE INDEX IF NOT EXISTS idx_naming_issues ON video_files(naming_issues)')
         
-        # Create main video files table
-        cursor.execute('''
-            CREATE TABLE IF NOT EXISTS video_files (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                file_path TEXT UNIQUE NOT NULL,
-                relative_path TEXT NOT NULL,
-                filename TEXT NOT NULL,
-                file_size INTEGER NOT NULL,
-                file_modified REAL NOT NULL,
-                last_scanned REAL NOT NULL,
-                width INTEGER,
-                height INTEGER,
-                duration REAL,
-                codec TEXT,
-                bitrate INTEGER,
-                framerate REAL,
-                has_external_subs BOOLEAN DEFAULT 0,
-                has_embedded_subs BOOLEAN DEFAULT 0,
-                subtitle_languages TEXT,
-                naming_issues TEXT,
-                needs_conversion BOOLEAN DEFAULT 0,
-                conversion_reason TEXT,
-                checksum TEXT
-            )
-        ''')
+        # Set secure file permissions on database (readable/writable by owner only)
+        try:
+            os.chmod(self.db_path, 0o600)
+        except OSError as e:
+            print(f"Warning: Could not set secure permissions on database: {e}")
+    
+    def security_audit_log(self, operation, details=""):
+        """Log security-relevant operations for audit purposes."""
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        log_entry = f"[{timestamp}] SECURITY: {operation}"
+        if details:
+            log_entry += f" - {details}"
         
-        # Create analysis sessions table
-        cursor.execute('''
-            CREATE TABLE IF NOT EXISTS analysis_sessions (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                timestamp REAL NOT NULL,
-                total_files INTEGER NOT NULL,
-                files_analyzed INTEGER NOT NULL,
-                duration_seconds REAL,
-                recommendations TEXT,
-                status TEXT DEFAULT 'completed'
-            )
-        ''')
+        # Log to secure file in base directory
+        audit_log_path = os.path.join(self.base_path, "security_audit.log")
+        try:
+            if self.validate_safe_path(audit_log_path):
+                with open(audit_log_path, 'a', encoding='utf-8') as f:
+                    f.write(log_entry + '\n')
+        except (OSError, IOError):
+            # Fallback to stderr if file logging fails
+            print(f"AUDIT: {log_entry}", file=sys.stderr)
+    
+    def sanitize_error_message(self, error_msg):
+        """Sanitize error messages to prevent information disclosure."""
+        if not isinstance(error_msg, str):
+            error_msg = str(error_msg)
         
-        # Create indexes for performance
-        cursor.execute('CREATE INDEX IF NOT EXISTS idx_file_path ON video_files(file_path)')
-        cursor.execute('CREATE INDEX IF NOT EXISTS idx_file_modified ON video_files(file_modified)')
-        cursor.execute('CREATE INDEX IF NOT EXISTS idx_needs_conversion ON video_files(needs_conversion)')
-        cursor.execute('CREATE INDEX IF NOT EXISTS idx_naming_issues ON video_files(naming_issues)')
+        # Replace absolute paths with relative paths
+        sanitized = error_msg.replace(self.base_path, "[BASE_PATH]")
         
-        conn.commit()
-        conn.close()
+        # Remove common sensitive patterns
+        import re
+        sanitized = re.sub(r'/Users/[^/\s]+', '/Users/[USER]', sanitized)
+        sanitized = re.sub(r'/home/[^/\s]+', '/home/[USER]', sanitized)
+        sanitized = re.sub(r'file://[^\s]+', 'file://[PATH]', sanitized)
+        
+        return sanitized
+    
+    def sanitize_path_for_display(self, path):
+        """Sanitize file paths for safe display in error messages."""
+        if not isinstance(path, str):
+            path = str(path)
+        
+        # Convert to relative path if under base_path
+        try:
+            if path.startswith(self.base_path):
+                return os.path.relpath(path, self.base_path)
+        except (ValueError, OSError):
+            pass
+        
+        # Replace sensitive directory patterns
+        import re
+        sanitized = re.sub(r'/Users/[^/\s]+', '/Users/[USER]', path)
+        sanitized = re.sub(r'/home/[^/\s]+', '/home/[USER]', sanitized)
+        sanitized = re.sub(r'/Volumes/[^/\s]+', '/Volumes/[VOLUME]', sanitized)
+        
+        return sanitized
+    
+    def check_rate_limit(self, operation_name="operation"):
+        """Check if operation is within rate limits to prevent DoS."""
+        with self._rate_limit_lock:
+            current_time = time.time()
+            
+            # Remove timestamps older than rate limit window
+            self.operation_timestamps = [
+                timestamp for timestamp in self.operation_timestamps 
+                if current_time - timestamp < self.rate_limit_window
+            ]
+            
+            # Check if we're over the rate limit
+            if len(self.operation_timestamps) >= self.max_operations_per_minute:
+                remaining_time = self.rate_limit_window - (current_time - self.operation_timestamps[0])
+                print(f"⚠️  Rate limit exceeded. Please wait {remaining_time:.1f} seconds before trying again.")
+                self.security_audit_log("RATE_LIMIT_EXCEEDED", f"Operation: {operation_name}")
+                return False
+            
+            # Check if too many failed operations
+            if self.failed_operation_count >= self.max_failed_operations:
+                print(f"⚠️  Too many failed operations ({self.failed_operation_count}). System temporarily locked.")
+                self.security_audit_log("FAILED_OP_LOCKOUT", f"Operation: {operation_name}")
+                return False
+            
+            # Record this operation
+            self.operation_timestamps.append(current_time)
+            return True
+    
+    def record_operation_failure(self, operation_name="operation"):
+        """Record a failed operation for DoS protection."""
+        with self._rate_limit_lock:
+            self.failed_operation_count += 1
+            self.security_audit_log("OPERATION_FAILED", f"Operation: {operation_name}, Total failures: {self.failed_operation_count}")
+    
+    def reset_failure_count(self):
+        """Reset failure count after successful operations."""
+        with self._rate_limit_lock:
+            if self.failed_operation_count > 0:
+                self.failed_operation_count = max(0, self.failed_operation_count - 1)
+    
+    def _signal_handler(self, signum, frame):
+        """Handle system signals for graceful shutdown."""
+        signal_name = signal.Signals(signum).name
+        print(f"\n⚠️  Received {signal_name} signal. Initiating graceful shutdown...")
+        self.security_audit_log("SIGNAL_RECEIVED", f"Signal: {signal_name}")
+        self._shutdown_requested = True
+        
+        # Cancel any active tasks
+        with self._task_lock:
+            for task_id in list(self.active_tasks.keys()):
+                self.active_tasks[task_id]['status'] = 'cancelled'
+        
+        self.cleanup_and_exit(0)
+    
+    def safe_input(self, prompt="", default=None, validator=None):
+        """Safe input handling with EOFError protection and validation."""
+        try:
+            # Check if running in non-interactive mode
+            if not sys.stdin.isatty():
+                if default is not None:
+                    return default
+                else:
+                    print(f"\nNon-interactive mode detected. Unable to get input for: {prompt}")
+                    self.cleanup_and_exit(1)
+            
+            user_input = input(prompt).strip()
+            
+            # Apply validator if provided
+            if validator:
+                validated = validator(user_input)
+                if validated is None:
+                    return self.safe_input(prompt, default, validator)
+                return validated
+            
+            return user_input
+            
+        except EOFError:
+            if default is not None:
+                return default
+            print("\nEOF detected. Exiting...")
+            self.cleanup_and_exit(0)
+        except KeyboardInterrupt:
+            print("\n\nOperation cancelled.")
+            self.cleanup_and_exit(0)
+    
+    def safe_int_input(self, prompt="", min_val=None, max_val=None, default=None):
+        """Safe integer input with validation."""
+        def int_validator(value):
+            if not value and default is not None:
+                return default
+            try:
+                num = int(value)
+                if min_val is not None and num < min_val:
+                    print(f"Value must be at least {min_val}")
+                    return None
+                if max_val is not None and num > max_val:
+                    print(f"Value must be at most {max_val}")
+                    return None
+                return num
+            except ValueError:
+                print("Please enter a valid number")
+                return None
+        
+        return self.safe_input(prompt, default, int_validator)
+    
+    def safe_path_input(self, prompt="", must_exist=True, base_path_required=True):
+        """Safe path input with validation."""
+        def path_validator(value):
+            if not value:
+                print("Path cannot be empty")
+                return None
+            
+            # Resolve path to absolute
+            abs_path = os.path.abspath(os.path.expanduser(value))
+            
+            # Check if path traversal attempt
+            if base_path_required:
+                try:
+                    # Ensure path is within base_path
+                    rel_path = os.path.relpath(abs_path, self.base_path)
+                    if rel_path.startswith('..'):
+                        print(f"Path must be within {self.base_path}")
+                        return None
+                except ValueError:
+                    print(f"Path must be within {self.base_path}")
+                    return None
+            
+            # Check existence if required
+            if must_exist and not os.path.exists(abs_path):
+                print(f"Path does not exist: {self.sanitize_path_for_display(abs_path)}")
+                return None
+            
+            return abs_path
+        
+        return self.safe_input(prompt, None, path_validator)
+    
+    def validate_safe_path(self, path):
+        """Validate that a path is safe for operations with strict directory access control."""
+        if not path:
+            return False
+        
+        # Normalize Unicode to handle different encodings
+        normalized_path = self.normalize_unicode_path(path)
+        
+        # Resolve to absolute path
+        abs_path = os.path.abspath(os.path.realpath(normalized_path))
+        
+        # STRICT: Ensure path is within base_path - no exceptions
+        try:
+            rel_path = os.path.relpath(abs_path, self.base_path)
+            if rel_path.startswith('..') or os.path.isabs(rel_path):
+                return False
+        except ValueError:
+            return False
+        
+        # Additional security: Check that resolved path starts with base_path
+        if not abs_path.startswith(self.base_path + os.sep) and abs_path != self.base_path:
+            return False
+        
+        # Check for invalid characters that could be used in command injection
+        invalid_chars = [';', '&', '|', '`', '$', '(', ')', '<', '>', '"', "'", '\x00', '\n', '\r', '\t']
+        if any(char in abs_path for char in invalid_chars):
+            return False
+        
+        # Additional FFmpeg-specific filename validation
+        filename = os.path.basename(abs_path)
+        # Reject filenames that could be interpreted as FFmpeg options
+        if filename.startswith('-') or filename.startswith('+'):
+            return False
+        
+        # Reject filenames with null bytes or control characters
+        if any(ord(c) < 32 for c in filename if c not in ['\n', '\r', '\t']):
+            return False
+        
+        # Validate Unicode normalization consistency
+        if normalized_path != path:
+            # Potential Unicode attack - reject path entirely for security
+            print(f"Security: Rejecting path with suspicious Unicode: {repr(self.sanitize_path_for_display(path))}")
+            return False
+        
+        # Additional Unicode security checks
+        # Reject paths with homograph characters that could be used for attacks
+        dangerous_chars = [
+            '\u202e',  # Right-to-left override
+            '\u202d',  # Left-to-right override
+            '\u200e',  # Left-to-right mark
+            '\u200f',  # Right-to-left mark
+            '\ufeff',  # Zero width no-break space
+            '\u200b',  # Zero width space
+            '\u2060',  # Word joiner
+        ]
+        if any(char in abs_path for char in dangerous_chars):
+            return False
+        
+        return True
+    
+    def normalize_unicode_path(self, path):
+        """Normalize Unicode in file paths to handle different encodings."""
+        if not isinstance(path, str):
+            path = str(path)
+        
+        # Normalize Unicode to NFC form (canonical decomposition + composition)
+        normalized = unicodedata.normalize('NFC', path)
+        
+        # Remove any zero-width or control characters that could cause issues
+        cleaned = ''.join(char for char in normalized 
+                         if not unicodedata.category(char).startswith('C') 
+                         or char in ['\n', '\r', '\t'])
+        
+        return cleaned
+    
+    def detect_file_encoding(self, file_path):
+        """Detect file encoding with fallback options."""
+        encodings_to_try = ['utf-8', 'utf-8-sig', 'latin1', 'cp1252', 'iso-8859-1']
+        
+        for encoding in encodings_to_try:
+            try:
+                with open(file_path, 'r', encoding=encoding) as f:
+                    # Try to read first few lines to test encoding
+                    f.read(1024)
+                return encoding
+            except (UnicodeDecodeError, UnicodeError):
+                continue
+            except (OSError, IOError):
+                break
+        
+        # Fallback to UTF-8 with error handling
+        return 'utf-8'
+    
+    def safe_read_text_file(self, file_path):
+        """Safely read text file with encoding detection."""
+        encoding = self.detect_file_encoding(file_path)
+        try:
+            with open(file_path, 'r', encoding=encoding, errors='replace') as f:
+                return f.read()
+        except (OSError, IOError, UnicodeError) as e:
+            print(f"Warning: Could not read text file {self.sanitize_path_for_display(file_path)}: {self.sanitize_error_message(str(e))}")
+            return None
+    
+    def safe_scan_directory(self, directory_path):
+        """Unicode-safe directory scanning with validation and resource limits."""
+        video_files = []
+        
+        # Validate directory is safe
+        if not self.validate_safe_path(directory_path):
+            print(f"Warning: Skipping unsafe directory: {directory_path}")
+            return video_files
+        
+        # Reset file counter for this scan
+        self.files_scanned_count = 0
+        
+        try:
+            for root, dirs, files in os.walk(directory_path, followlinks=False):
+                # Check resource limits
+                if self.files_scanned_count >= self.max_files_per_scan:
+                    print(f"Warning: File scan limit reached ({self.max_files_per_scan}). Stopping scan.")
+                    break
+                
+                # Check directory depth to prevent deep recursion attacks
+                depth = len(os.path.relpath(root, directory_path).split(os.sep))
+                if depth > self.max_directory_depth:
+                    print(f"Warning: Maximum directory depth ({self.max_directory_depth}) exceeded. Skipping: {root}")
+                    dirs.clear()  # Don't recurse further
+                    continue
+                # Validate each subdirectory is safe
+                if not self.validate_safe_path(root):
+                    print(f"Warning: Skipping unsafe subdirectory: {root}")
+                    continue
+                
+                for file in files:
+                    # Check file count limit
+                    if self.files_scanned_count >= self.max_files_per_scan:
+                        print(f"Warning: File scan limit reached. Processed {self.files_scanned_count} files.")
+                        break
+                    
+                    try:
+                        # Normalize Unicode in filename
+                        normalized_file = self.normalize_unicode_path(file)
+                        
+                        if normalized_file.lower().endswith(self.video_extensions):
+                            file_path = os.path.join(root, normalized_file)
+                            
+                            # Double-check the final path is safe
+                            if self.validate_safe_path(file_path):
+                                video_files.append(file_path)
+                                self.files_scanned_count += 1
+                            else:
+                                print(f"Warning: Skipping unsafe file: {self.sanitize_path_for_display(file_path)}")
+                        
+                        self.files_scanned_count += 1
+                    
+                    except UnicodeError as e:
+                        print(f"Warning: Unicode error processing file {file}: {e}")
+                        continue
+                        
+        except (OSError, IOError) as e:
+            print(f"Error scanning directory {self.sanitize_path_for_display(directory_path)}: {self.sanitize_error_message(str(e))}")
+        
+        return video_files
+    
+    def check_file_permissions(self, file_path, operation='read'):
+        """Check file permissions before operations."""
+        if not os.path.exists(file_path):
+            return False, "File does not exist"
+        
+        if operation == 'read':
+            if not os.access(file_path, os.R_OK):
+                return False, "No read permission"
+        elif operation == 'write':
+            if os.path.isfile(file_path) and not os.access(file_path, os.W_OK):
+                return False, "No write permission"
+            elif os.path.isdir(file_path) and not os.access(file_path, os.W_OK):
+                return False, "No write permission to directory"
+        elif operation == 'delete':
+            parent_dir = os.path.dirname(file_path)
+            if not os.access(parent_dir, os.W_OK):
+                return False, "No delete permission (parent directory not writable)"
+        
+        return True, "OK"
+    
+    def check_disk_space(self, required_bytes=0):
+        """Check available disk space with symlink attack protection."""
+        try:
+            # Resolve symlinks to prevent symlink attacks
+            real_path = os.path.realpath(self.base_path)
+            
+            # Validate the resolved path is still safe
+            if not real_path.startswith('/Volumes/media/'):
+                return False, "Disk space check blocked - potential symlink attack"
+            
+            total, used, free = shutil.disk_usage(real_path)
+            
+            if required_bytes > 0 and free < required_bytes:
+                return False, f"Insufficient disk space. Need {required_bytes/(1024**3):.2f} GB, have {free/(1024**3):.2f} GB"
+            
+            # Warn if less than 5% free space
+            if free / total < 0.05:
+                return False, f"Low disk space warning: Only {free/(1024**3):.2f} GB ({(free/total)*100:.1f}%) remaining"
+            
+            return True, f"Available: {free/(1024**3):.2f} GB"
+            
+        except OSError as e:
+            return False, f"Could not check disk space: {e}"
+    
+    def safe_file_delete(self, file_path):
+        """Safely delete file with comprehensive checks."""
+        # Validate path is safe
+        if not self.validate_safe_path(file_path):
+            return False, "Unsafe file path"
+        
+        # Check permissions
+        can_delete, perm_msg = self.check_file_permissions(file_path, 'delete')
+        if not can_delete:
+            return False, f"Permission denied: {perm_msg}"
+        
+        # Check if file is being used (basic check)
+        try:
+            # Try to open file exclusively to check if it's in use
+            with open(file_path, 'r+b') as f:
+                pass
+        except PermissionError:
+            return False, "File appears to be in use by another application"
+        except (OSError, IOError) as e:
+            return False, f"Cannot access file: {e}"
+        
+        # Perform deletion
+        try:
+            os.remove(file_path)
+            # Log security-relevant file deletion
+            self.security_audit_log("FILE_DELETED", f"Path: {file_path}")
+            return True, "File deleted successfully"
+        except (OSError, IOError) as e:
+            return False, f"Deletion failed: {e}"
+    
+    def safe_directory_delete(self, dir_path):
+        """Safely delete directory with comprehensive checks."""
+        # Validate path is safe
+        if not self.validate_safe_path(dir_path):
+            return False, "Unsafe directory path"
+        
+        # Check if directory exists
+        if not os.path.isdir(dir_path):
+            return False, "Path is not a directory"
+        
+        # Check permissions
+        can_delete, perm_msg = self.check_file_permissions(dir_path, 'delete')
+        if not can_delete:
+            return False, f"Permission denied: {perm_msg}"
+        
+        # Additional safety: ensure directory is within base_path
+        if not dir_path.startswith(self.base_path + os.sep):
+            return False, "Directory must be within base path"
+        
+        # Perform deletion
+        try:
+            shutil.rmtree(dir_path)
+            # Log security-relevant directory deletion
+            self.security_audit_log("DIRECTORY_DELETED", f"Path: {dir_path}")
+            return True, "Directory deleted successfully"
+        except OSError as e:
+            return False, f"Failed to delete directory: {e}"
+    
+    def safe_file_rename(self, old_path, new_path):
+        """Safely rename file with validation."""
+        # Validate both paths are safe
+        if not self.validate_safe_path(old_path) or not self.validate_safe_path(new_path):
+            return False, "Unsafe file path"
+        
+        # Check if source exists
+        if not os.path.exists(old_path):
+            return False, "Source file does not exist"
+        
+        # Check if destination already exists
+        if os.path.exists(new_path):
+            return False, "Destination file already exists"
+        
+        # Perform rename
+        try:
+            os.rename(old_path, new_path)
+            self.security_audit_log("FILE_RENAMED", f"From: {old_path} To: {new_path}")
+            return True, "File renamed successfully"
+        except OSError as e:
+            return False, f"Failed to rename file: {e}"
+    
+    def cleanup_and_exit(self, exit_code=0):
+        """Perform cleanup before exiting."""
+        try:
+            # Close any active database connections
+            if hasattr(self, '_active_connections'):
+                for conn in self._active_connections:
+                    try:
+                        conn.close()
+                    except (sqlite3.Error, OSError) as e:
+                        self.security_audit_log("DB_CLOSE_ERROR", f"Failed to close connection: {e}")
+            
+            # Clean up temporary files if any exist
+            temp_files = ['temp_scan.py', 'temp_convert.py']
+            for temp_file in temp_files:
+                if os.path.exists(temp_file):
+                    try:
+                        os.remove(temp_file)
+                    except OSError as e:
+                        self.security_audit_log("TEMP_CLEANUP_ERROR", f"Failed to remove {temp_file}: {e}")
+            
+            print("\nCleanup completed.")
+        except Exception as e:
+            self.security_audit_log("CLEANUP_ERROR", f"Cleanup failed: {e}")
+        
+        sys.exit(exit_code)
+    
+    def check_dependencies(self):
+        """Check all required dependencies at startup."""
+        missing_deps = []
+        
+        # Check FFmpeg
+        try:
+            result = subprocess.run(['ffmpeg', '-version'], capture_output=True, text=True, timeout=TimeoutConstants.QUICK)
+            if result.returncode != 0:
+                missing_deps.append("FFmpeg")
+        except (subprocess.SubprocessError, FileNotFoundError, subprocess.TimeoutExpired):
+            missing_deps.append("FFmpeg")
+        
+        # Check FFprobe
+        try:
+            result = subprocess.run(['ffprobe', '-version'], capture_output=True, text=True, timeout=TimeoutConstants.QUICK)
+            if result.returncode != 0:
+                missing_deps.append("FFprobe")
+        except (subprocess.SubprocessError, FileNotFoundError, subprocess.TimeoutExpired):
+            missing_deps.append("FFprobe")
+        
+        # Check Python virtual environment (configurable via environment variable)
+        python_env_path = os.environ.get('MEDIA_MANAGER_PYTHON_ENV', 
+                                        os.path.join(self.base_path, "convert_env", "bin", "python"))
+        
+        # Validate the Python environment path is safe
+        if not self.validate_safe_path(python_env_path):
+            print(f"Warning: Python environment path is unsafe: {self.sanitize_path_for_display(python_env_path)}")
+            python_env_path = sys.executable  # Fallback to current Python
+        elif not os.path.exists(python_env_path):
+            print(f"Warning: Python virtual environment not found at {python_env_path}")
+            python_env_path = sys.executable  # Fallback to current Python
+        
+        self.python_executable = python_env_path
+        
+        # Check optional dependencies
+        self.optional_deps = {}
+        
+        # Check subliminal
+        try:
+            import subliminal
+            self.optional_deps['subliminal'] = True
+        except ImportError:
+            self.optional_deps['subliminal'] = False
+            print("Info: subliminal not installed - subtitle download will be unavailable")
+        
+        # Check rclone
+        try:
+            result = subprocess.run(['rclone', 'version'], capture_output=True, text=True, timeout=TimeoutConstants.QUICK)
+            self.optional_deps['rclone'] = (result.returncode == 0)
+        except (subprocess.SubprocessError, FileNotFoundError, subprocess.TimeoutExpired):
+            self.optional_deps['rclone'] = False
+            print("Info: rclone not installed - backup/sync will be unavailable")
+        
+        # Report critical missing dependencies
+        if missing_deps:
+            print("❌ Critical dependencies missing:")
+            for dep in missing_deps:
+                print(f"  - {dep}")
+            print("\nPlease install missing dependencies before running.")
+            self.cleanup_and_exit(1)
+    
+    def get_video_resolution_safe(self, file_path):
+        """Safely get video resolution using FFprobe without temporary scripts."""
+        # Validate path first
+        if not self.validate_safe_path(file_path):
+            return None, None
+        
+        cmd = [
+            "ffprobe",
+            "-v", "error",
+            "-select_streams", "v:0",
+            "-show_entries", "stream=width,height", 
+            "-of", "csv=s=x:p=0",
+            file_path
+        ]
+        
+        try:
+            result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, 
+                                  text=True, timeout=TimeoutConstants.STANDARD)
+            if result.returncode == 0:
+                try:
+                    width, height = result.stdout.strip().split('x')
+                    return int(width), int(height)
+                except (ValueError, AttributeError):
+                    pass
+        except (subprocess.SubprocessError, subprocess.TimeoutExpired):
+            pass
+        
+        return None, None
+    
+    def convert_video_safe(self, file_path, output_file, target_width, target_height):
+        """Safely convert video without temporary scripts."""
+        # Validate paths
+        if not self.validate_safe_path(file_path) or not self.validate_safe_path(output_file):
+            return False
+        
+        # Validate width/height parameters to prevent injection
+        try:
+            target_width = int(target_width)
+            target_height = int(target_height)
+            if target_width <= 0 or target_height <= 0 or target_width > 7680 or target_height > 4320:
+                return False
+        except (ValueError, TypeError):
+            return False
+        
+        cmd = [
+            "ffmpeg",
+            "-i", file_path,
+            "-vf", f"scale={target_width}:{target_height}",
+            "-c:v", "libx264",
+            "-crf", "23", 
+            "-preset", "medium",
+            "-c:a", "aac",
+            "-b:a", "128k",
+            "-y",
+            output_file
+        ]
+        
+        try:
+            result = subprocess.run(cmd, timeout=TimeoutConstants.LONG)  # 1 hour timeout
+            return result.returncode == 0
+        except (subprocess.SubprocessError, subprocess.TimeoutExpired):
+            return False
+    
+    def safe_file_operation(self, operation, file_path, *args, **kwargs):
+        """Safely perform file operations with Unicode and comprehensive error handling."""
+        try:
+            # Normalize the file path
+            normalized_path = self.normalize_unicode_path(file_path)
+            
+            # Validate the path is safe
+            if not self.validate_safe_path(normalized_path):
+                raise ValueError(f"Unsafe file path: {self.sanitize_path_for_display(file_path)}")
+            
+            # Check file permissions based on operation type
+            operation_name = operation.__name__ if hasattr(operation, '__name__') else str(operation)
+            if 'write' in operation_name.lower() or 'convert' in operation_name.lower():
+                can_access, msg = self.check_file_permissions(normalized_path, 'write')
+                if not can_access:
+                    raise PermissionError(f"Write permission denied: {msg}")
+            elif 'delete' in operation_name.lower() or 'remove' in operation_name.lower():
+                can_access, msg = self.check_file_permissions(normalized_path, 'delete')
+                if not can_access:
+                    raise PermissionError(f"Delete permission denied: {msg}")
+            else:
+                # Default to read permission check
+                can_access, msg = self.check_file_permissions(normalized_path, 'read')
+                if not can_access:
+                    raise PermissionError(f"Read permission denied: {msg}")
+            
+            # Perform the operation
+            return operation(normalized_path, *args, **kwargs)
+            
+        except UnicodeError as e:
+            print(f"Unicode error with file {self.sanitize_path_for_display(file_path)}: {self.sanitize_error_message(str(e))}")
+            return None
+        except PermissionError as e:
+            print(f"Permission error for {self.sanitize_path_for_display(file_path)}: {self.sanitize_error_message(str(e))}")
+            return None
+        except (OSError, IOError) as e:
+            print(f"File operation error for {self.sanitize_path_for_display(file_path)}: {self.sanitize_error_message(str(e))}")
+            return None
     
     def get_db_connection(self):
-        """Get database connection with row factory."""
-        conn = sqlite3.connect(self.db_path)
-        conn.row_factory = sqlite3.Row
-        return conn
+        """DEPRECATED: Use get_db_context() instead for proper connection management."""
+        raise DeprecationWarning("Use get_db_context() instead for proper connection management")
+    
+    def get_db_context(self):
+        """Get database connection as context manager for safe handling."""
+        return DatabaseContext(self.db_path)
     
     def get_file_checksum(self, file_path, size_limit_gb=1):
         """Generate checksum for small files or size-based hash for large files."""
-        try:
-            file_size = os.path.getsize(file_path)
-            
-            # For large files, use size + mtime as quick hash
-            if file_size > size_limit_gb * 1024**3:
-                mtime = os.path.getmtime(file_path)
-                return f"size_{file_size}_mtime_{int(mtime)}"
-            
-            # For smaller files, use actual file hash
-            hash_md5 = hashlib.md5()
-            with open(file_path, "rb") as f:
-                for chunk in iter(lambda: f.read(8192), b""):
-                    hash_md5.update(chunk)
-            return hash_md5.hexdigest()
-            
-        except:
-            return None
+        # Use safe file operation with Unicode handling
+        return self.safe_file_operation(self._calculate_checksum, file_path, size_limit_gb)
+    
+    def _calculate_checksum(self, file_path, size_limit_gb=1):
+        """Internal checksum calculation."""
+        file_size = os.path.getsize(file_path)
+        
+        # Validate file size to prevent integer overflow issues
+        if file_size > FileSizeConstants.MAX_FILE_SIZE:
+            raise ValueError(f"File too large: {file_size} bytes exceeds maximum {FileSizeConstants.MAX_FILE_SIZE} bytes")
+        
+        # For large files, use size + mtime as quick hash
+        if file_size > size_limit_gb * FileSizeConstants.GB:
+            mtime = os.path.getmtime(file_path)
+            return f"size_{file_size}_mtime_{int(mtime)}"
+        
+        # For smaller files, use secure file hash (SHA-256)
+        hash_sha256 = hashlib.sha256()
+        with open(file_path, "rb") as f:
+            for chunk in iter(lambda: f.read(8192), b""):
+                hash_sha256.update(chunk)
+        return hash_sha256.hexdigest()
     
     def is_file_changed(self, file_path):
         """Check if file has changed since last scan."""
-        conn = self.get_db_connection()
-        cursor = conn.cursor()
-        
-        try:
-            # Get file stats
-            stat = os.stat(file_path)
-            current_mtime = stat.st_mtime
-            current_size = stat.st_size
+        with self.get_db_context() as conn:
+            cursor = conn.cursor()
             
-            # Check database
-            cursor.execute(
-                'SELECT file_modified, file_size, checksum FROM video_files WHERE file_path = ?',
-                (file_path,)
-            )
-            row = cursor.fetchone()
-            
-            if not row:
-                return True  # New file
-            
-            # Check if basic file attributes changed
-            if row['file_modified'] != current_mtime or row['file_size'] != current_size:
-                return True
+            try:
+                # Get file stats
+                stat = os.stat(file_path)
+                current_mtime = stat.st_mtime
+                current_size = stat.st_size
                 
-            return False
-            
-        except:
-            return True  # Error, assume changed
-        finally:
-            conn.close()
+                # Check database
+                cursor.execute(
+                    'SELECT file_modified, file_size, checksum FROM video_files WHERE file_path = ?',
+                    (file_path,)
+                )
+                row = cursor.fetchone()
+                
+                if not row:
+                    return True  # New file
+                
+                # Check if basic file attributes changed
+                if row['file_modified'] != current_mtime or row['file_size'] != current_size:
+                    return True
+                    
+                return False
+                
+            except (OSError, IOError, sqlite3.Error) as e:
+                print(f"Warning: Could not check file change status for {self.sanitize_path_for_display(file_path)}: {self.sanitize_error_message(str(e))}")
+                return True  # Error, assume changed
+    
+    def validate_file_data(self, file_data):
+        """Validate file data before database insertion."""
+        required_fields = ['file_path', 'relative_path', 'filename', 'file_size', 'file_modified']
+        
+        # Check required fields
+        for field in required_fields:
+            if field not in file_data or file_data[field] is None:
+                raise ValueError(f"Missing required field: {field}")
+        
+        # Validate file_path exists and is accessible
+        file_path = file_data['file_path']
+        if not os.path.exists(file_path):
+            raise ValueError(f"File does not exist: {self.sanitize_path_for_display(file_path)}")
+        
+        # Validate file size matches actual file
+        actual_size = os.path.getsize(file_path)
+        if file_data['file_size'] != actual_size:
+            raise ValueError(f"File size mismatch: DB={file_data['file_size']}, Actual={actual_size}")
+        
+        # Validate modification time is reasonable
+        actual_mtime = os.path.getmtime(file_path)
+        if abs(file_data['file_modified'] - actual_mtime) > 1.0:  # Allow 1 second tolerance
+            raise ValueError(f"Modification time mismatch: DB={file_data['file_modified']}, Actual={actual_mtime}")
+        
+        # Validate numeric fields are within reasonable bounds
+        if file_data['file_size'] < 0 or file_data['file_size'] > FileSizeConstants.MAX_FILE_SIZE:
+            raise ValueError(f"File size out of bounds: {file_data['file_size']}")
+        
+        # Validate optional numeric fields
+        for field, max_val in [('width', 16384), ('height', 16384), ('bitrate', 1000000000), ('framerate', 500)]:
+            if file_data.get(field) is not None:
+                value = file_data[field]
+                if not isinstance(value, (int, float)) or value < 0 or value > max_val:
+                    raise ValueError(f"{field} out of bounds: {value}")
+        
+        # Validate text fields for suspicious content
+        text_fields = ['codec', 'subtitle_languages', 'naming_issues', 'conversion_reason']
+        for field in text_fields:
+            if file_data.get(field):
+                value = str(file_data[field])
+                # Check for SQL injection patterns
+                suspicious_patterns = ['DROP', 'DELETE', 'INSERT', 'UPDATE', 'UNION', '--', ';', 'EXEC']
+                if any(pattern in value.upper() for pattern in suspicious_patterns):
+                    self.security_audit_log("SUSPICIOUS_DATA", f"Field {field}: {value[:50]}")
+                    file_data[field] = "[SANITIZED]"
     
     def save_video_metadata(self, file_data):
-        """Save or update video metadata in database."""
-        conn = self.get_db_connection()
-        cursor = conn.cursor()
-        
+        """Save or update video metadata in database with validation."""
+        # Validate data before saving
         try:
+            self.validate_file_data(file_data)
+        except ValueError as e:
+            self.security_audit_log("DATA_VALIDATION_FAILED", str(e))
+            print(f"⚠️  Data validation failed: {e}")
+            return False
+        
+        with self.get_db_context() as conn:
+            cursor = conn.cursor()
+            
             cursor.execute('''
                 INSERT OR REPLACE INTO video_files (
                     file_path, relative_path, filename, file_size, file_modified,
@@ -164,17 +1001,82 @@ class MediaManager:
                 file_data.get('conversion_reason'),
                 file_data.get('checksum')
             ))
+        
+        return True
+    
+    def verify_database_integrity(self):
+        """Verify database integrity and consistency with file system."""
+        print("🔍 Verifying database integrity...")
+        
+        with self.get_db_context() as conn:
+            cursor = conn.cursor()
             
-            conn.commit()
-        finally:
-            conn.close()
+            # Get all database entries
+            cursor.execute('SELECT file_path, file_size, file_modified, checksum FROM video_files')
+            db_entries = cursor.fetchall()
+            
+            inconsistencies = []
+            checked_count = 0
+            
+            for row in db_entries:
+                file_path = row['file_path']
+                db_size = row['file_size']
+                db_mtime = row['file_modified']
+                db_checksum = row['checksum']
+                
+                try:
+                    # Check if file still exists
+                    if not os.path.exists(file_path):
+                        inconsistencies.append({
+                            'file': self.sanitize_path_for_display(file_path),
+                            'issue': 'File no longer exists'
+                        })
+                        continue
+                    
+                    # Check file size
+                    actual_size = os.path.getsize(file_path)
+                    if db_size != actual_size:
+                        inconsistencies.append({
+                            'file': self.sanitize_path_for_display(file_path),
+                            'issue': f'Size mismatch: DB={db_size}, Actual={actual_size}'
+                        })
+                    
+                    # Check modification time (allow 1 second tolerance)
+                    actual_mtime = os.path.getmtime(file_path)
+                    if abs(db_mtime - actual_mtime) > 1.0:
+                        inconsistencies.append({
+                            'file': self.sanitize_path_for_display(file_path),
+                            'issue': f'Modified time mismatch'
+                        })
+                    
+                    checked_count += 1
+                    
+                except (OSError, IOError) as e:
+                    inconsistencies.append({
+                        'file': self.sanitize_path_for_display(file_path),
+                        'issue': f'Access error: {self.sanitize_error_message(str(e))}'
+                    })
+            
+            # Report results
+            print(f"✅ Checked {checked_count} database entries")
+            if inconsistencies:
+                print(f"⚠️  Found {len(inconsistencies)} inconsistencies:")
+                for issue in inconsistencies[:10]:  # Limit output
+                    print(f"  {issue['file']}: {issue['issue']}")
+                if len(inconsistencies) > 10:
+                    print(f"  ... and {len(inconsistencies) - 10} more")
+                
+                self.security_audit_log("DB_INTEGRITY_ISSUES", f"Found {len(inconsistencies)} inconsistencies")
+                return False
+            else:
+                print("✅ Database integrity verified - no inconsistencies found")
+                return True
     
     def get_cached_analysis(self, max_age_hours=24):
         """Get cached analysis results if recent enough."""
-        conn = self.get_db_connection()
-        cursor = conn.cursor()
-        
-        try:
+        with self.get_db_context() as conn:
+            cursor = conn.cursor()
+            
             # Get most recent analysis session
             cursor.execute('''
                 SELECT * FROM analysis_sessions 
@@ -196,16 +1098,12 @@ class MediaManager:
                 'videos': [dict(row) for row in videos],
                 'timestamp': session['timestamp']
             }
-            
-        finally:
-            conn.close()
     
     def save_analysis_session(self, total_files, files_analyzed, duration_seconds, recommendations):
         """Save analysis session metadata."""
-        conn = self.get_db_connection()
-        cursor = conn.cursor()
-        
-        try:
+        with self.get_db_context() as conn:
+            cursor = conn.cursor()
+            
             cursor.execute('''
                 INSERT INTO analysis_sessions (
                     timestamp, total_files, files_analyzed, duration_seconds, 
@@ -219,12 +1117,146 @@ class MediaManager:
                 json.dumps(recommendations),
                 'completed'
             ))
-            conn.commit()
-        finally:
-            conn.close()
+    
+    def add_background_task(self, task_type, file_path, action_func, description):
+        """Add a task to the background processing queue."""
+        self.task_counter += 1
+        task = {
+            'id': self.task_counter,
+            'type': task_type,
+            'file_path': file_path,
+            'action': action_func,
+            'description': description,
+            'status': 'queued',
+            'started_at': None,
+            'completed_at': None,
+            'result': None
+        }
+        self.task_queue.put(task)
+        return task['id']
+    
+    def process_background_tasks(self, found_issues):
+        """Process background tasks with concurrent execution."""
+        if self.task_queue.empty():
+            return
+        
+        print(f"\n🔧 Starting background task processing (max {self.max_concurrent_tasks} concurrent)...")
+        
+        def execute_task(task):
+            task['status'] = 'running'
+            task['started_at'] = time.time()
+            self.active_tasks[task['id']] = task
+            
+            try:
+                result = task['action'](task['file_path'])
+                task['result'] = result
+                task['status'] = 'completed'
+            except (subprocess.SubprocessError, OSError, IOError, ValueError, UnicodeError) as e:
+                task['result'] = f"Error: {self.sanitize_error_message(str(e))}"
+                task['status'] = 'failed'
+            except Exception as e:
+                # Log unexpected exceptions for security monitoring
+                self.security_audit_log("UNEXPECTED_TASK_ERROR", f"Task {task['id']}: {type(e).__name__}")
+                task['result'] = "Error: Task failed"
+                task['status'] = 'failed'
+            finally:
+                task['completed_at'] = time.time()
+                if task['id'] in self.active_tasks:
+                    del self.active_tasks[task['id']]
+                self.completed_tasks.append(task)
+            
+            return task
+        
+        # Convert queue to list for ThreadPoolExecutor
+        tasks_to_process = []
+        while not self.task_queue.empty():
+            tasks_to_process.append(self.task_queue.get())
+        
+        if not tasks_to_process:
+            return
+        
+        # Execute tasks with limited concurrency
+        with ThreadPoolExecutor(max_workers=self.max_concurrent_tasks) as executor:
+            futures = {executor.submit(execute_task, task): task for task in tasks_to_process}
+            
+            for future in as_completed(futures):
+                task = futures[future]
+                try:
+                    completed_task = future.result()
+                    status_icon = "✅" if completed_task['status'] == 'completed' else "❌"
+                    found_issues['background_tasks'].append(f"{status_icon} {completed_task['description']}")
+                except (KeyError, TypeError, AttributeError) as e:
+                    found_issues['background_tasks'].append(f"❌ Task {task['id']} failed: Parse error")
+    
+    def download_subtitle_task(self, file_path):
+        """Background task for downloading subtitles."""
+        try:
+            # Check if subliminal is available
+            if not self.optional_deps.get('subliminal', False):
+                print(f"Subliminal not available for {self.sanitize_path_for_display(file_path)}")
+                return
+            
+            import subliminal
+            from subliminal import download_best_subtitles, save_subtitles
+            from babelfish import Language
+            
+            # Create video object
+            video_path = Path(file_path)
+            video = subliminal.scan_video(str(video_path))
+            
+            # Download English subtitles
+            subtitles = download_best_subtitles([video], {Language('en')})
+            
+            if video in subtitles and subtitles[video]:
+                save_subtitles(video, subtitles[video])
+                return f"Downloaded {len(subtitles[video])} subtitle(s)"
+            else:
+                return "No subtitles found"
+                
+        except ImportError:
+            return "subliminal not installed (pip install subliminal)"
+        except (subprocess.SubprocessError, OSError, IOError) as e:
+            return f"Error: {self.sanitize_error_message(str(e))}"
+    
+    def remove_system_file_task(self, file_path):
+        """Background task for removing system files."""
+        # Use safe deletion method
+        success, message = self.safe_file_delete(file_path)
+        if success:
+            return "Removed successfully"
+        else:
+            return f"Error removing: {message}"
+    
+    def check_video_corruption_task(self, file_path):
+        """Background task for checking video file integrity."""
+        try:
+            # Quick integrity check using ffprobe
+            cmd = [
+                'ffprobe',
+                '-v', 'error',
+                '-f', 'null',
+                '-',
+                '-i', file_path
+            ]
+            
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=TimeoutConstants.STANDARD)
+            
+            if result.returncode == 0:
+                return "File integrity OK"
+            else:
+                return f"Corruption detected: {result.stderr.strip()}"
+                
+        except subprocess.TimeoutExpired:
+            return "Timeout during check (file may be corrupted)"
+        except (subprocess.SubprocessError, OSError, IOError) as e:
+            return f"Error checking: {self.sanitize_error_message(str(e))}"
 
     def clear_screen(self):
-        os.system('clear' if os.name == 'posix' else 'cls')
+        # Safe screen clearing without os.system()
+        if os.name == 'posix':
+            print('\033[H\033[2J\033[3J', end='')
+        else:
+            print('\033[2J\033[H', end='')
         
     def get_video_info(self, file_path):
         """Get video information using ffprobe."""
@@ -237,11 +1269,18 @@ class MediaManager:
             file_path
         ]
         try:
-            result = subprocess.run(cmd, capture_output=True, text=True)
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=TimeoutConstants.STANDARD)
             if result.returncode == 0:
-                return json.loads(result.stdout)
-        except Exception as e:
-            print(f"Error getting info for {file_path}: {e}")
+                try:
+                    # Safe JSON parsing with size limit to prevent DoS
+                    if len(result.stdout) > 1024 * 1024:  # 1MB limit
+                        raise ValueError("JSON output too large")
+                    return json.loads(result.stdout)
+                except (json.JSONDecodeError, ValueError) as e:
+                    self.security_audit_log("JSON_PARSE_ERROR", f"Failed to parse FFprobe JSON: {e}")
+                    return None
+        except (subprocess.SubprocessError, OSError, IOError) as e:
+            print(f"Error getting info for {file_path}: {self.sanitize_error_message(str(e))}")
         return None
     
     def inventory_videos(self):
@@ -255,12 +1294,12 @@ class MediaManager:
         errors = 0
         
         # First, count total files for progress
-        total_files = sum(1 for root, dirs, files in os.walk(self.base_path) 
+        total_files = sum(1 for root, dirs, files in os.walk(self.base_path, followlinks=False) 
                          for file in files if file.lower().endswith(self.video_extensions))
         
         print(f"Found {total_files} video files to inventory\n")
         
-        for root, dirs, files in os.walk(self.base_path):
+        for root, dirs, files in os.walk(self.base_path, followlinks=False):
             for file in files:
                 if file.lower().endswith(self.video_extensions):
                     file_path = os.path.join(root, file)
@@ -285,9 +1324,14 @@ class MediaManager:
                         errors += 1
                         continue
         
-        # Save inventory to file
+        # Save inventory to file in secure location
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        inventory_file = f"video_inventory_{timestamp}.txt"
+        inventory_file = os.path.join(self.base_path, f"video_inventory_{timestamp}.txt")
+        
+        # Validate write path is safe
+        if not self.validate_safe_path(inventory_file):
+            print("Error: Cannot write inventory file to unsafe location")
+            return
         
         with open(inventory_file, 'w') as f:
             f.write(f"Video Inventory - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
@@ -305,107 +1349,76 @@ class MediaManager:
         if errors > 0:
             print(f"  Errors: {errors} files could not be read")
         print(f"  Saved to: {inventory_file}")
-        input("\nPress Enter to continue...")
+        self.safe_input("\nPress Enter to continue...")
         
     def list_conversion_candidates(self):
         """List videos that are candidates for conversion."""
         print("\nFinding conversion candidates...")
         
-        # Use the scan_and_convert.py script's logic
-        cmd = [
-            "./convert_env/bin/python",
-            "scan_and_convert.py",
-            self.base_path
-        ]
+        # Direct method implementation - no temporary scripts
+        candidates = []
         
-        # Create a temporary version that just lists without prompting
-        temp_script = """import os
-import subprocess
-import sys
-
-def get_video_resolution(file_path):
-    cmd = [
-        "ffprobe",
-        "-v", "error",
-        "-select_streams", "v:0",
-        "-show_entries", "stream=width,height",
-        "-of", "csv=s=x:p=0",
-        file_path
-    ]
-    result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-    if result.returncode == 0:
-        try:
-            width, height = result.stdout.strip().split('x')
-            return int(width), int(height)
-        except ValueError:
-            pass
-    return None, None
-
-directory = sys.argv[1] if len(sys.argv) > 1 else os.getcwd()
-candidates = []
-
-# Count total files first
-total_files = sum(1 for root, _, files in os.walk(directory) 
-                 for file in files 
-                 if file.lower().endswith(('.mp4', '.mkv', '.avi', '.mov', '.flv')) 
-                 and "-CONVERTED" not in file)
-
-print(f"Scanning {total_files} video files for resolution...", file=sys.stderr)
-files_checked = 0
-
-for root, _, files in os.walk(directory):
-    for file in files:
-        if "-CONVERTED" in file:
-            continue
-        file_path = os.path.join(root, file)
-        if file.lower().endswith(('.mp4', '.mkv', '.avi', '.mov', '.flv')):
-            files_checked += 1
-            if files_checked % 5 == 0:
-                print(f"Checked {files_checked}/{total_files} files...", file=sys.stderr, end='\\r')
+        # Count total files first
+        total_files = 0
+        for root, _, files in os.walk(self.base_path, followlinks=False):
+            for file in files:
+                if (file.lower().endswith(('.mp4', '.mkv', '.avi', '.mov', '.flv')) 
+                    and "-CONVERTED" not in file):
+                    total_files += 1
+        
+        print(f"Scanning {total_files} video files for resolution...")
+        files_checked = 0
+        
+        for root, _, files in os.walk(self.base_path, followlinks=False):
+            for file in files:
+                if "-CONVERTED" in file:
+                    continue
+                    
+                file_path = os.path.join(root, file)
+                if file.lower().endswith(('.mp4', '.mkv', '.avi', '.mov', '.flv')):
+                    files_checked += 1
+                    if files_checked % 5 == 0:
+                        print(f"Checked {files_checked}/{total_files} files...", end='\r')
+                    
+                    width, height = self.get_video_resolution_safe(file_path)
+                    if width and height and (width > 1920 or height > 1080):
+                        try:
+                            file_size_gb = os.path.getsize(file_path) / (1024 ** 3)
+                            candidates.append(f"{file_path}|{width}x{height}|{file_size_gb:.2f}")
+                        except OSError:
+                            continue
+        
+        print(f"\nScan complete! Checked {files_checked} files")
+        
+        if candidates:
+            print(f"\nFound {len(candidates)} videos larger than 1080p:\n")
             
-            width, height = get_video_resolution(file_path)
-            if width and height and (width > 1920 or height > 1080):
-                file_size_gb = os.path.getsize(file_path) / (1024 ** 3)
-                print(f"{file_path}|{width}x{height}|{file_size_gb:.2f}")
-
-print(f"\\nScan complete! Checked {files_checked} files", file=sys.stderr)
-"""
-        
-        with open("temp_scan.py", "w") as f:
-            f.write(temp_script)
-        
-        result = subprocess.run(
-            ["./convert_env/bin/python", "temp_scan.py", self.base_path],
-            capture_output=True,
-            text=True
-        )
-        
-        os.remove("temp_scan.py")
-        
-        if result.stdout:
-            lines = result.stdout.strip().split('\n')
-            print(f"\nFound {len(lines)} videos larger than 1080p:\n")
-            
-            candidates = []
-            for line in lines:
+            # Parse candidates list 
+            parsed_candidates = []
+            for line in candidates:
                 if '|' in line:
                     path, resolution, size = line.split('|')
-                    candidates.append((path, resolution, float(size)))
+                    parsed_candidates.append((path, resolution, float(size)))
             
-            # Save to file
-            with open("conversion_candidates.txt", "w") as f:
+            # Save to file in secure location
+            candidates_file = os.path.join(self.base_path, "conversion_candidates.txt")
+            if not self.validate_safe_path(candidates_file):
+                print("Error: Cannot write candidates file to unsafe location")
+                return
+            
+            with open(candidates_file, "w") as f:
                 f.write(f"Conversion Candidates - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
                 f.write("="*80 + "\n\n")
-                for path, res, size in sorted(candidates, key=lambda x: x[2], reverse=True):
+                for path, res, size in sorted(parsed_candidates, key=lambda x: x[2], reverse=True):
                     f.write(f"{res} - {size:.2f} GB - {path}\n")
             
             # Display summary
-            for i, (path, res, size) in enumerate(candidates[:10], 1):
+            for i, (path, res, size) in enumerate(parsed_candidates[:10], 1):
                 print(f"{i}. {os.path.basename(path)}")
                 print(f"   Resolution: {res}, Size: {size:.2f} GB")
             
-            if len(candidates) > 10:
-                print(f"\n... and {len(candidates) - 10} more")
+            if len(parsed_candidates) > 10:
+                print(f"\n... and {len(parsed_candidates) - 10} more")
             
             print(f"\nFull list saved to: conversion_candidates.txt")
         else:
@@ -427,7 +1440,7 @@ print(f"\\nScan complete! Checked {files_checked} files", file=sys.stderr)
                     total_size = 0
                     file_count = 0
                     
-                    for root, dirs, files in os.walk(show_path):
+                    for root, dirs, files in os.walk(show_path, followlinks=False):
                         for file in files:
                             if file.lower().endswith(self.video_extensions):
                                 try:
@@ -465,7 +1478,7 @@ print(f"\\nScan complete! Checked {files_checked} files", file=sys.stderr)
         
         all_videos = []
         
-        for root, dirs, files in os.walk(self.base_path):
+        for root, dirs, files in os.walk(self.base_path, followlinks=False):
             for file in files:
                 if file.lower().endswith(self.video_extensions):
                     file_path = os.path.join(root, file)
@@ -511,14 +1524,14 @@ print(f"\\nScan complete! Checked {files_checked} files", file=sys.stderr)
         for i, show in enumerate(shows, 1):
             show_path = os.path.join(tv_path, show)
             size = sum(os.path.getsize(os.path.join(root, f)) 
-                      for root, _, files in os.walk(show_path) 
+                      for root, _, files in os.walk(show_path, followlinks=False) 
                       for f in files) / (1024**3)
             print(f"{i:3}. {show} ({size:.2f} GB)")
         
         print(f"\n  0. Cancel")
         
         try:
-            choice = int(input("\nEnter show number to delete: "))
+            choice = self.safe_int_input("\nEnter show number to delete: ", 0, len(sorted_shows))
             if choice == 0:
                 return
             
@@ -526,10 +1539,13 @@ print(f"\\nScan complete! Checked {files_checked} files", file=sys.stderr)
                 show_to_delete = shows[choice - 1]
                 show_path = os.path.join(tv_path, show_to_delete)
                 
-                confirm = input(f"\nAre you sure you want to delete '{show_to_delete}'? (yes/no): ")
+                confirm = self.safe_input(f"\nAre you sure you want to delete '{show_to_delete}'? (yes/no): ")
                 if confirm.lower() == 'yes':
-                    shutil.rmtree(show_path)
-                    print(f"✓ Deleted '{show_to_delete}'")
+                    success, message = self.safe_directory_delete(show_path)
+                    if success:
+                        print(f"✓ Deleted '{show_to_delete}'")
+                    else:
+                        print(f"✗ Failed to delete '{show_to_delete}': {message}")
                 else:
                     print("Deletion cancelled.")
             else:
@@ -541,14 +1557,14 @@ print(f"\\nScan complete! Checked {files_checked} files", file=sys.stderr)
         
     def delete_video_file(self):
         """Delete a specific video file."""
-        search = input("\nEnter part of the filename to search for: ").strip()
+        search = self.safe_input("\nEnter part of the filename to search for: ")
         
         if not search:
             return
         
         matching_files = []
         
-        for root, dirs, files in os.walk(self.base_path):
+        for root, dirs, files in os.walk(self.base_path, followlinks=False):
             for file in files:
                 if search.lower() in file.lower() and file.lower().endswith(self.video_extensions):
                     file_path = os.path.join(root, file)
@@ -578,17 +1594,21 @@ print(f"\\nScan complete! Checked {files_checked} files", file=sys.stderr)
         print(f"\n  0. Cancel")
         
         try:
-            choice = int(input("\nEnter file number to delete: "))
+            choice = self.safe_int_input("\nEnter file number to delete: ", 0, len(matching_files))
             if choice == 0:
                 return
             
             if 1 <= choice <= min(len(matching_files), 20):
                 file_to_delete = matching_files[choice - 1]
                 
-                confirm = input(f"\nAre you sure you want to delete '{file_to_delete['name']}'? (yes/no): ")
+                confirm = self.safe_input(f"\nAre you sure you want to delete '{file_to_delete['name']}'? (yes/no): ")
                 if confirm.lower() == 'yes':
-                    os.remove(file_to_delete['path'])
-                    print(f"✓ Deleted '{file_to_delete['name']}'")
+                    # Use safe file deletion
+                    success, message = self.safe_file_delete(file_to_delete['path'])
+                    if success:
+                        print(f"✓ {message}: '{file_to_delete['name']}'")
+                    else:
+                        print(f"❌ Failed to delete '{file_to_delete['name']}': {message}")
                 else:
                     print("Deletion cancelled.")
             else:
@@ -605,7 +1625,7 @@ print(f"\\nScan complete! Checked {files_checked} files", file=sys.stderr)
         videos_without_subs = []
         videos_checked = 0
         
-        for root, dirs, files in os.walk(self.base_path):
+        for root, dirs, files in os.walk(self.base_path, followlinks=False):
             for file in files:
                 if file.lower().endswith(self.video_extensions):
                     file_path = os.path.join(root, file)
@@ -653,7 +1673,7 @@ print(f"\\nScan complete! Checked {files_checked} files", file=sys.stderr)
         print(f"Found {len(videos_without_subs)} videos without English subtitles:\n")
         
         # Save to file
-        with open("videos_without_subtitles.txt", "w") as f:
+        with open(os.path.join(self.base_path, "videos_without_subtitles.txt"), "w") as f:
             f.write(f"Videos Without English Subtitles - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
             f.write("="*80 + "\n\n")
             
@@ -674,6 +1694,13 @@ print(f"\\nScan complete! Checked {files_checked} files", file=sys.stderr)
         """Convert videos to specified resolution (1080p or 720p)."""
         print(f"\nPreparing to convert videos to {target_resolution}p...")
         
+        # Check disk space before starting conversions
+        has_space, space_msg = self.check_disk_space(FileSizeConstants.LARGE_FILE_THRESHOLD)  # Require 5GB minimum
+        if not has_space:
+            print(f"❌ Cannot proceed: {space_msg}")
+            self.safe_input("\nPress Enter to continue...")
+            return
+        
         # Create conversion script for the target resolution
         if target_resolution == 1080:
             target_height = 1080
@@ -688,7 +1715,7 @@ print(f"\\nScan complete! Checked {files_checked} files", file=sys.stderr)
         print(f"3. Convert single file")
         print(f"0. Cancel")
         
-        choice = input("\nEnter your choice: ").strip()
+        choice = self.safe_input("\nEnter your choice: ")
         
         if choice == '0':
             return
@@ -696,14 +1723,14 @@ print(f"\\nScan complete! Checked {files_checked} files", file=sys.stderr)
             # Run scan_and_convert with modifications for target resolution
             self.run_conversion_scan(target_resolution, target_width, target_height)
         elif choice == '2':
-            directory = input("\nEnter directory path: ").strip()
+            directory = self.safe_path_input("\nEnter directory path: ")
             if os.path.exists(directory):
                 self.run_conversion_scan(target_resolution, target_width, target_height, directory)
             else:
                 print("Directory not found!")
                 input("\nPress Enter to continue...")
         elif choice == '3':
-            file_path = input("\nEnter video file path: ").strip()
+            file_path = self.safe_path_input("\nEnter video file path: ")
             if os.path.exists(file_path):
                 self.convert_single_file(file_path, target_resolution, target_width, target_height)
             else:
@@ -715,106 +1742,77 @@ print(f"\\nScan complete! Checked {files_checked} files", file=sys.stderr)
         if directory is None:
             directory = self.base_path
             
-        # Create temporary conversion script
-        temp_script = f"""import os
-import subprocess
-import sys
-
-def get_video_resolution(file_path):
-    cmd = [
-        "ffprobe",
-        "-v", "error",
-        "-select_streams", "v:0",
-        "-show_entries", "stream=width,height",
-        "-of", "csv=s=x:p=0",
-        file_path
-    ]
-    result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-    if result.returncode == 0:
-        try:
-            width, height = result.stdout.strip().split('x')
-            return int(width), int(height)
-        except ValueError:
-            pass
-    return None, None
-
-def convert_video(file_path, output_file, target_width, target_height):
-    cmd = [
-        "ffmpeg",
-        "-i", file_path,
-        "-vf", f"scale={target_width}:{target_height}",
-        "-c:v", "libx264",
-        "-crf", "23",
-        "-preset", "medium",
-        "-c:a", "aac",
-        "-b:a", "128k",
-        "-y",
-        output_file
-    ]
-    print(f"Converting: {{os.path.basename(file_path)}}")
-    subprocess.run(cmd)
-
-directory = sys.argv[1]
-target_resolution = {target_resolution}
-target_width = {target_width}
-target_height = {target_height}
-
-print(f"Scanning for videos larger than {{target_resolution}}p...")
-candidates = []
-
-for root, _, files in os.walk(directory):
-    for file in files:
-        if "-CONVERTED" in file:
-            continue
-        file_path = os.path.join(root, file)
-        if file.lower().endswith(('.mp4', '.mkv', '.avi', '.mov', '.flv')):
-            width, height = get_video_resolution(file_path)
-            if width and height and (width > target_width or height > target_height):
-                file_size_gb = os.path.getsize(file_path) / (1024 ** 3)
-                candidates.append({{
-                    'path': file_path,
-                    'width': width,
-                    'height': height,
-                    'size_gb': file_size_gb
-                }})
-
-if not candidates:
-    print(f"\\nNo videos found larger than {{target_resolution}}p.")
-    sys.exit(0)
-
-print(f"\\nFound {{len(candidates)}} videos to convert:")
-for i, video in enumerate(candidates[:10], 1):
-    print(f"{{i}}. {{os.path.basename(video['path'])}}")
-    print(f"   Resolution: {{video['width']}}x{{video['height']}}, Size: {{video['size_gb']:.2f}} GB")
-
-if len(candidates) > 10:
-    print(f"\\n... and {{len(candidates) - 10}} more")
-
-response = input(f"\\nConvert these videos to {{target_resolution}}p? (y/N): ")
-if response.lower() != 'y':
-    print("Conversion cancelled.")
-    sys.exit(0)
-
-for i, video in enumerate(candidates, 1):
-    print(f"\\n[{{i}}/{{len(candidates)}}] Processing {{video['path']}}")
-    
-    output_file = os.path.splitext(video['path'])[0] + "_temp.mp4"
-    convert_video(video['path'], output_file, target_width, target_height)
-    
-    # Rename files
-    converted_filename = f"{{os.path.splitext(video['path'])[0]}}-CONVERTED{{os.path.splitext(video['path'])[1]}}"
-    os.rename(video['path'], converted_filename)
-    os.rename(output_file, os.path.splitext(video['path'])[0] + ".mp4")
-    print(f"✓ Conversion complete!")
-
-print(f"\\n✓ All conversions complete! Converted {{len(candidates)}} videos to {{target_resolution}}p.")
-"""
+        # Direct method implementation - no temporary scripts
+        # Validate directory path first
+        if not self.validate_safe_path(directory):
+            print(f"Error: Invalid or unsafe directory path: {self.sanitize_path_for_display(directory)}")
+            return
         
-        with open("temp_convert.py", "w") as f:
-            f.write(temp_script)
+        print(f"Scanning for videos larger than {target_resolution}p...")
+        candidates = []
         
-        subprocess.run(["./convert_env/bin/python", "temp_convert.py", directory])
-        os.remove("temp_convert.py")
+        for root, _, files in os.walk(directory, followlinks=False):
+            for file in files:
+                if "-CONVERTED" in file:
+                    continue
+                file_path = os.path.join(root, file)
+                if file.lower().endswith(('.mp4', '.mkv', '.avi', '.mov', '.flv')):
+                    width, height = self.get_video_resolution_safe(file_path)
+                    if width and height and (width > target_width or height > target_height):
+                        try:
+                            file_size_gb = os.path.getsize(file_path) / (1024 ** 3)
+                            candidates.append({
+                                'path': file_path,
+                                'width': width,
+                                'height': height,
+                                'size_gb': file_size_gb
+                            })
+                        except OSError:
+                            continue
+        
+        if not candidates:
+            print(f"\nNo videos found larger than {target_resolution}p.")
+            return
+        
+        print(f"\nFound {len(candidates)} videos to convert:")
+        for i, video in enumerate(candidates[:10], 1):
+            print(f"{i}. {os.path.basename(video['path'])}")
+            print(f"   Resolution: {video['width']}x{video['height']}, Size: {video['size_gb']:.2f} GB")
+        
+        if len(candidates) > 10:
+            print(f"\n... and {len(candidates) - 10} more")
+        
+        response = self.safe_input(f"\nConvert these videos to {target_resolution}p? (y/N): ")
+        if response.lower() != 'y':
+            print("Conversion cancelled.")
+            return
+        
+        for i, video in enumerate(candidates, 1):
+            print(f"\n[{i}/{len(candidates)}] Processing {video['path']}")
+            
+            # Create unique temporary filename to avoid race conditions
+            timestamp = int(time.time() * 1000)  # millisecond timestamp
+            output_file = os.path.splitext(video['path'])[0] + f"_temp_{timestamp}_{os.getpid()}.mp4"
+            success = self.convert_video_safe(video['path'], output_file, target_width, target_height)
+            
+            if success:
+                # Rename files
+                try:
+                    converted_filename = f"{os.path.splitext(video['path'])[0]}-CONVERTED{os.path.splitext(video['path'])[1]}"
+                    os.rename(video['path'], converted_filename)
+                    self.security_audit_log("VIDEO_CONVERTED", f"Original renamed to: {converted_filename}")
+                    os.rename(output_file, os.path.splitext(video['path'])[0] + ".mp4")
+                    self.security_audit_log("VIDEO_CONVERTED", f"New file: {os.path.splitext(video['path'])[0]}.mp4")
+                    print(f"✓ Conversion complete!")
+                except OSError as e:
+                    print(f"✗ Error renaming files: {e}")
+            else:
+                print(f"✗ Conversion failed!")
+                # Clean up temporary file on failure
+                if os.path.exists(output_file):
+                    self.safe_file_delete(output_file)
+        
+        print(f"\n✓ All conversions complete! Converted {len(candidates)} videos to {target_resolution}p.")
         
         input("\nPress Enter to continue...")
         
@@ -822,7 +1820,25 @@ print(f"\\n✓ All conversions complete! Converted {{len(candidates)}} videos to
         """Convert a single video file."""
         print(f"\nConverting {os.path.basename(file_path)} to {target_resolution}p...")
         
-        output_file = os.path.splitext(file_path)[0] + "_temp.mp4"
+        # Create unique temporary filename to avoid race conditions
+        timestamp = int(time.time() * 1000)  # millisecond timestamp
+        output_file = os.path.splitext(file_path)[0] + f"_temp_{timestamp}_{os.getpid()}.mp4"
+        
+        # Validate parameters to prevent injection
+        try:
+            target_width = int(target_width)
+            target_height = int(target_height)
+            if target_width <= 0 or target_height <= 0 or target_width > 7680 or target_height > 4320:
+                print("Error: Invalid resolution parameters")
+                return
+        except (ValueError, TypeError):
+            print("Error: Invalid resolution parameters")
+            return
+        
+        # Validate file paths
+        if not self.validate_safe_path(file_path) or not self.validate_safe_path(output_file):
+            print("Error: Unsafe file path")
+            return
         
         cmd = [
             "ffmpeg",
@@ -837,7 +1853,13 @@ print(f"\\n✓ All conversions complete! Converted {{len(candidates)}} videos to
             output_file
         ]
         
-        subprocess.run(cmd)
+        result = subprocess.run(cmd, timeout=TimeoutConstants.LONG)  # 1 hour timeout
+        if result.returncode != 0:
+            print("✗ Conversion failed!")
+            # Clean up temporary file on failure
+            if os.path.exists(output_file):
+                self.safe_file_delete(output_file)
+            return
         
         # Rename files
         converted_filename = f"{os.path.splitext(file_path)[0]}-CONVERTED{os.path.splitext(file_path)[1]}"
@@ -857,36 +1879,29 @@ print(f"\\n✓ All conversions complete! Converted {{len(candidates)}} videos to
         print("3. Download for single video")
         print("0. Cancel")
         
-        choice = input("\nEnter your choice: ").strip()
+        choice = self.safe_input("\nEnter your choice: ")
         
         if choice == '0':
             return
             
-        # Check if subliminal is installed
-        try:
-            import subliminal
-        except ImportError:
-            print("\nSubliminal is not installed. Installing now...")
-            subprocess.run([sys.executable, "-m", "pip", "install", "subliminal"])
-            try:
-                import subliminal
-            except ImportError:
-                print("Failed to install subliminal. Please install manually:")
-                print("pip install subliminal")
-                input("\nPress Enter to continue...")
-                return
+        # Check if subliminal is available
+        if not self.optional_deps.get('subliminal', False):
+            print("\nSubliminal is not installed. Please install it manually:")
+            print("pip install subliminal")
+            self.safe_input("\nPress Enter to continue...")
+            return
         
         if choice == '1':
             self.download_subtitles_batch(self.base_path)
         elif choice == '2':
-            directory = input("\nEnter directory path: ").strip()
+            directory = self.safe_path_input("\nEnter directory path: ")
             if os.path.exists(directory):
                 self.download_subtitles_batch(directory)
             else:
                 print("Directory not found!")
                 input("\nPress Enter to continue...")
         elif choice == '3':
-            file_path = input("\nEnter video file path: ").strip()
+            file_path = self.safe_path_input("\nEnter video file path: ")
             if os.path.exists(file_path):
                 self.download_subtitle_for_file(file_path)
             else:
@@ -902,12 +1917,12 @@ print(f"\\n✓ All conversions complete! Converted {{len(candidates)}} videos to
         videos_with_subs = 0
         
         # First count total videos
-        total_videos = sum(1 for root, dirs, files in os.walk(directory) 
+        total_videos = sum(1 for root, dirs, files in os.walk(directory, followlinks=False) 
                           for file in files if file.lower().endswith(self.video_extensions))
         
         print(f"Found {total_videos} video files to check...")
         
-        for root, dirs, files in os.walk(directory):
+        for root, dirs, files in os.walk(directory, followlinks=False):
             for file in files:
                 if file.lower().endswith(self.video_extensions):
                     file_path = os.path.join(root, file)
@@ -952,7 +1967,7 @@ print(f"\\n✓ All conversions complete! Converted {{len(candidates)}} videos to
         print(f"  Videos with subtitles: {videos_with_subs}")
         print(f"  Videos needing subtitles: {len(videos_needing_subs)}")
         
-        response = input("\nDownload subtitles for these videos? (y/N): ")
+        response = self.safe_input("\nDownload subtitles for these videos? (y/N): ")
         
         if response.lower() != 'y':
             return
@@ -979,7 +1994,7 @@ print(f"\\n✓ All conversions complete! Converted {{len(candidates)}} videos to
         print(f"  Failed: {len(failed_downloads)}")
         
         if failed_downloads:
-            with open("failed_subtitle_downloads.txt", "w") as f:
+            with open(os.path.join(self.base_path, "failed_subtitle_downloads.txt"), "w") as f:
                 f.write("Failed Subtitle Downloads\n")
                 f.write("="*50 + "\n")
                 for path in failed_downloads:
@@ -1004,7 +2019,7 @@ print(f"\\n✓ All conversions complete! Converted {{len(candidates)}} videos to
                 print(f"     File: {os.path.basename(video_path)}")
                 print(f"     Searching providers...")
             
-            result = subprocess.run(cmd, capture_output=True, text=True)
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=TimeoutConstants.STANDARD)
             
             # Show subliminal output if there's an error or in verbose mode
             if not quiet and result.stderr:
@@ -1026,9 +2041,9 @@ print(f"\\n✓ All conversions complete! Converted {{len(candidates)}} videos to
                     print(f"✗ Error downloading subtitle: {result.stderr}")
                 return False
                 
-        except Exception as e:
+        except (subprocess.SubprocessError, OSError, IOError) as e:
             if not quiet:
-                print(f"✗ Error: {e}")
+                print(f"✗ Error: {self.sanitize_error_message(str(e))}")
             return False
         
     def quick_fixes(self):
@@ -1047,7 +2062,7 @@ print(f"\\n✓ All conversions complete! Converted {{len(candidates)}} videos to
             print("0. Back to main menu")
             print()
             
-            choice = input("Enter your choice: ").strip()
+            choice = self.safe_input("Enter your choice: ")
             
             if choice == '0':
                 break
@@ -1071,7 +2086,7 @@ print(f"\\n✓ All conversions complete! Converted {{len(candidates)}} videos to
         sample_patterns = ['sample', 'trailer', 'preview']
         files_to_remove = []
         
-        for root, dirs, files in os.walk(self.base_path):
+        for root, dirs, files in os.walk(self.base_path, followlinks=False):
             for file in files:
                 if file.lower().endswith(self.video_extensions):
                     # Check filename
@@ -1099,13 +2114,12 @@ print(f"\\n✓ All conversions complete! Converted {{len(candidates)}} videos to
         
         print(f"\nTotal size: {total_size:.1f} MB")
         
-        response = input("\nDelete these files? (y/N): ")
+        response = self.safe_input("\nDelete these files? (y/N): ")
         if response.lower() == 'y':
             for path, _ in files_to_remove:
-                try:
-                    os.remove(path)
-                except OSError as e:
-                    print(f"Error deleting {path}: {e}")
+                success, message = self.safe_file_delete(path)
+                if not success:
+                    print(f"Error deleting {path}: {message}")
             print(f"✓ Deleted {len(files_to_remove)} files")
         
         input("\nPress Enter to continue...")
@@ -1117,16 +2131,16 @@ print(f"\\n✓ All conversions complete! Converted {{len(candidates)}} videos to
         system_files = ['.DS_Store', 'Thumbs.db', 'desktop.ini', '._.DS_Store']
         files_removed = 0
         
-        for root, dirs, files in os.walk(self.base_path):
+        for root, dirs, files in os.walk(self.base_path, followlinks=False):
             for file in files:
                 if file in system_files or file.startswith('._'):
                     file_path = os.path.join(root, file)
-                    try:
-                        os.remove(file_path)
+                    success, message = self.safe_file_delete(file_path)
+                    if success:
                         files_removed += 1
-                        print(f"Removed: {file_path}")
-                    except OSError:
-                        pass
+                        print(f"Removed: {self.sanitize_path_for_display(file_path)}")
+                    else:
+                        print(f"Failed to remove {self.sanitize_path_for_display(file_path)}: {message}")
         
         print(f"\n✓ Removed {files_removed} system files")
         input("\nPress Enter to continue...")
@@ -1137,7 +2151,7 @@ print(f"\\n✓ All conversions complete! Converted {{len(candidates)}} videos to
         
         empty_folders = []
         
-        for root, dirs, files in os.walk(self.base_path, topdown=False):
+        for root, dirs, files in os.walk(self.base_path, topdown=False, followlinks=False):
             if not dirs and not files and root != self.base_path:
                 empty_folders.append(root)
         
@@ -1153,7 +2167,7 @@ print(f"\\n✓ All conversions complete! Converted {{len(candidates)}} videos to
         if len(empty_folders) > 20:
             print(f"... and {len(empty_folders) - 20} more")
         
-        response = input("\nDelete these folders? (y/N): ")
+        response = self.safe_input("\nDelete these folders? (y/N): ")
         if response.lower() == 'y':
             for folder in empty_folders:
                 try:
@@ -1170,7 +2184,7 @@ print(f"\\n✓ All conversions complete! Converted {{len(candidates)}} videos to
         
         converted_files = []
         
-        for root, dirs, files in os.walk(self.base_path):
+        for root, dirs, files in os.walk(self.base_path, followlinks=False):
             for file in files:
                 if '-CONVERTED' in file:
                     file_path = os.path.join(root, file)
@@ -1193,13 +2207,13 @@ print(f"\\n✓ All conversions complete! Converted {{len(candidates)}} videos to
         if len(converted_files) > 10:
             print(f"... and {len(converted_files) - 10} more")
         
-        response = input("\nRemove '-CONVERTED' suffix from these files? (y/N): ")
+        response = self.safe_input("\nRemove '-CONVERTED' suffix from these files? (y/N): ")
         if response.lower() == 'y':
             for old_path, new_path in converted_files:
                 try:
                     os.rename(old_path, new_path)
                 except OSError as e:
-                    print(f"Error renaming {old_path}: {e}")
+                    print(f"Error renaming {self.sanitize_path_for_display(old_path)}: {self.sanitize_error_message(str(e))}")
             print(f"✓ Renamed {len(converted_files)} files")
         
         input("\nPress Enter to continue...")
@@ -1220,7 +2234,7 @@ print(f"\\n✓ All conversions complete! Converted {{len(candidates)}} videos to
             '-.': '-',  # Dash period
         }
         
-        for root, dirs, files in os.walk(self.base_path):
+        for root, dirs, files in os.walk(self.base_path, followlinks=False):
             for file in files:
                 if file.lower().endswith(self.video_extensions):
                     new_name = file
@@ -1252,13 +2266,13 @@ print(f"\\n✓ All conversions complete! Converted {{len(candidates)}} videos to
         if len(issues_found) > 10:
             print(f"... and {len(issues_found) - 10} more")
         
-        response = input("\nFix these naming issues? (y/N): ")
+        response = self.safe_input("\nFix these naming issues? (y/N): ")
         if response.lower() == 'y':
             for old_path, new_path, _, _ in issues_found:
                 try:
                     os.rename(old_path, new_path)
                 except OSError as e:
-                    print(f"Error renaming {old_path}: {e}")
+                    print(f"Error renaming {self.sanitize_path_for_display(old_path)}: {self.sanitize_error_message(str(e))}")
             print(f"✓ Fixed {len(issues_found)} files")
         
         input("\nPress Enter to continue...")
@@ -1270,7 +2284,7 @@ print(f"\\n✓ All conversions complete! Converted {{len(candidates)}} videos to
         subtitle_extensions = ['.srt', '.vtt', '.ass', '.sub', '.ssa']
         duplicates = []
         
-        for root, dirs, files in os.walk(self.base_path):
+        for root, dirs, files in os.walk(self.base_path, followlinks=False):
             # Group subtitles by base video name
             video_subs = {}
             
@@ -1312,13 +2326,12 @@ print(f"\\n✓ All conversions complete! Converted {{len(candidates)}} videos to
         if len(duplicates) > 10:
             print(f"... and {len(duplicates) - 10} more")
         
-        response = input("\nRemove duplicate subtitles? (y/N): ")
+        response = self.safe_input("\nRemove duplicate subtitles? (y/N): ")
         if response.lower() == 'y':
             for dup, _ in duplicates:
-                try:
-                    os.remove(dup)
-                except OSError as e:
-                    print(f"Error removing {dup}: {e}")
+                success, message = self.safe_file_delete(dup)
+                if not success:
+                    print(f"Error removing {dup}: {message}")
             print(f"✓ Removed {len(duplicates)} duplicate subtitle files")
         
         input("\nPress Enter to continue...")
@@ -1331,7 +2344,7 @@ print(f"\\n✓ All conversions complete! Converted {{len(candidates)}} videos to
         print("3. Find duplicate episodes in TV shows")
         print("0. Cancel")
         
-        choice = input("\nEnter your choice: ").strip()
+        choice = self.safe_input("\nEnter your choice: ")
         
         if choice == '0':
             return
@@ -1352,12 +2365,12 @@ print(f"\\n✓ All conversions complete! Converted {{len(candidates)}} videos to
         files_processed = 0
         
         # Count total files first
-        total_files = sum(1 for root, dirs, files in os.walk(self.base_path) 
+        total_files = sum(1 for root, dirs, files in os.walk(self.base_path, followlinks=False) 
                          for file in files if file.lower().endswith(self.video_extensions))
         
         print(f"Analyzing {total_files} video files...\n")
         
-        for root, dirs, files in os.walk(self.base_path):
+        for root, dirs, files in os.walk(self.base_path, followlinks=False):
             for file in files:
                 if file.lower().endswith(self.video_extensions):
                     file_path = os.path.join(root, file)
@@ -1413,7 +2426,7 @@ print(f"\\n✓ All conversions complete! Converted {{len(candidates)}} videos to
         print(f"\nTotal wasted space: {total_wasted:.2f} GB")
         
         # Save report
-        with open("duplicate_files_report.txt", "w") as f:
+        with open(os.path.join(self.base_path, "duplicate_files_report.txt"), "w") as f:
             f.write(f"Duplicate Files Report - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
             f.write("="*80 + "\n\n")
             
@@ -1434,7 +2447,7 @@ print(f"\\n✓ All conversions complete! Converted {{len(candidates)}} videos to
         import difflib
         
         videos = []
-        for root, dirs, files in os.walk(self.base_path):
+        for root, dirs, files in os.walk(self.base_path, followlinks=False):
             for file in files:
                 if file.lower().endswith(self.video_extensions):
                     file_path = os.path.join(root, file)
@@ -1527,15 +2540,18 @@ print(f"\\n✓ All conversions complete! Converted {{len(candidates)}} videos to
             
             episodes = {}
             
-            for root, dirs, files in os.walk(show_path):
+            for root, dirs, files in os.walk(show_path, followlinks=False):
                 for file in files:
                     if file.lower().endswith(self.video_extensions):
                         # Try to extract season and episode
                         for pattern in episode_patterns:
                             match = re.search(pattern, file, re.IGNORECASE)
                             if match:
-                                season = int(match.group(1))
-                                episode = int(match.group(2))
+                                try:
+                                    season = int(match.group(1))
+                                    episode = int(match.group(2))
+                                except (ValueError, IndexError):
+                                    continue
                                 key = f"S{season:02d}E{episode:02d}"
                                 
                                 if key not in episodes:
@@ -1577,7 +2593,7 @@ print(f"\\n✓ All conversions complete! Converted {{len(candidates)}} videos to
         print("5. Full health report")
         print("0. Cancel")
         
-        choice = input("\nEnter your choice: ").strip()
+        choice = self.safe_input("\nEnter your choice: ")
         
         if choice == '0':
             return
@@ -1597,7 +2613,7 @@ print(f"\\n✓ All conversions complete! Converted {{len(candidates)}} videos to
         print("\nChecking for corrupted files (this may take a while)...")
         
         # Count total files first
-        total_files = sum(1 for root, dirs, files in os.walk(self.base_path) 
+        total_files = sum(1 for root, dirs, files in os.walk(self.base_path, followlinks=False) 
                          for file in files if file.lower().endswith(self.video_extensions))
         
         print(f"Found {total_files} video files to check\n")
@@ -1605,7 +2621,7 @@ print(f"\\n✓ All conversions complete! Converted {{len(candidates)}} videos to
         corrupted_files = []
         checked = 0
         
-        for root, dirs, files in os.walk(self.base_path):
+        for root, dirs, files in os.walk(self.base_path, followlinks=False):
             for file in files:
                 if file.lower().endswith(self.video_extensions):
                     file_path = os.path.join(root, file)
@@ -1625,7 +2641,7 @@ print(f"\\n✓ All conversions complete! Converted {{len(candidates)}} videos to
                         file_path
                     ]
                     
-                    result = subprocess.run(cmd, capture_output=True, text=True)
+                    result = subprocess.run(cmd, capture_output=True, text=True, timeout=TimeoutConstants.STANDARD)
                     if result.returncode != 0 or not result.stdout.strip():
                         corrupted_files.append(file_path)
         
@@ -1637,7 +2653,7 @@ print(f"\\n✓ All conversions complete! Converted {{len(candidates)}} videos to
             print(f"⚠️  Found {len(corrupted_files)} potentially corrupted files:")
             
             # Save to file
-            with open("corrupted_files_report.txt", "w") as f:
+            with open(os.path.join(self.base_path, "corrupted_files_report.txt"), "w") as f:
                 f.write(f"Corrupted Files Report - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
                 f.write("="*80 + "\n\n")
                 
@@ -1654,7 +2670,7 @@ print(f"\\n✓ All conversions complete! Converted {{len(candidates)}} videos to
         print("\nChecking for unusual video codecs...")
         
         # Count total files
-        total_files = sum(1 for root, dirs, files in os.walk(self.base_path) 
+        total_files = sum(1 for root, dirs, files in os.walk(self.base_path, followlinks=False) 
                          for file in files if file.lower().endswith(self.video_extensions))
         
         print(f"Analyzing {total_files} video files for codec information...\n")
@@ -1663,7 +2679,7 @@ print(f"\\n✓ All conversions complete! Converted {{len(candidates)}} videos to
         common_codecs = ['h264', 'hevc', 'h265', 'vp9', 'av1']
         files_checked = 0
         
-        for root, dirs, files in os.walk(self.base_path):
+        for root, dirs, files in os.walk(self.base_path, followlinks=False):
             for file in files:
                 if file.lower().endswith(self.video_extensions):
                     file_path = os.path.join(root, file)
@@ -1730,14 +2746,17 @@ print(f"\\n✓ All conversions complete! Converted {{len(candidates)}} videos to
             
             episodes = set()
             
-            for root, dirs, files in os.walk(show_path):
+            for root, dirs, files in os.walk(show_path, followlinks=False):
                 for file in files:
                     if file.lower().endswith(self.video_extensions):
                         match = re.search(episode_pattern, file, re.IGNORECASE)
                         if match:
-                            season = int(match.group(1))
-                            episode = int(match.group(2))
-                            episodes.add((season, episode))
+                            try:
+                                season = int(match.group(1))
+                                episode = int(match.group(2))
+                                episodes.add((season, episode))
+                            except (ValueError, IndexError):
+                                continue
             
             if episodes:
                 # Check for gaps
@@ -1766,7 +2785,7 @@ print(f"\\n✓ All conversions complete! Converted {{len(candidates)}} videos to
         
         suspicious_files = []
         
-        for root, dirs, files in os.walk(self.base_path):
+        for root, dirs, files in os.walk(self.base_path, followlinks=False):
             for file in files:
                 if file.lower().endswith(self.video_extensions):
                     file_path = os.path.join(root, file)
@@ -1806,13 +2825,13 @@ print(f"\\n✓ All conversions complete! Converted {{len(candidates)}} videos to
         
         # Count total items
         print("Counting files and folders...")
-        total_items = sum(1 for root, dirs, files in os.walk(self.base_path) for _ in files)
+        total_items = sum(1 for root, dirs, files in os.walk(self.base_path, followlinks=False) for _ in files)
         items_processed = 0
         
         print(f"Analyzing {total_items} items...\n")
         
         # Count everything
-        for root, dirs, files in os.walk(self.base_path):
+        for root, dirs, files in os.walk(self.base_path, followlinks=False):
             for file in files:
                 items_processed += 1
                 
@@ -1825,7 +2844,7 @@ print(f"\\n✓ All conversions complete! Converted {{len(candidates)}} videos to
                         report['total_videos'] += 1
                         report['total_size_gb'] += size / (1024**3)
                         
-                        if size < 10 * 1024 * 1024:  # Less than 10MB
+                        if size < 10 * FileSizeConstants.MB:  # Less than 10MB
                             report['small_files'] += 1
                             
                     except OSError:
@@ -1835,12 +2854,17 @@ print(f"\\n✓ All conversions complete! Converted {{len(candidates)}} videos to
                     report['system_files'] += 1
         
         # Count empty folders
-        for root, dirs, files in os.walk(self.base_path, topdown=False):
+        for root, dirs, files in os.walk(self.base_path, topdown=False, followlinks=False):
             if not dirs and not files and root != self.base_path:
                 report['empty_folders'] += 1
         
-        # Generate report
-        report_filename = f"health_report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
+        # Generate report in secure location
+        report_filename = os.path.join(self.base_path, f"health_report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt")
+        
+        # Validate write path is safe
+        if not self.validate_safe_path(report_filename):
+            print("Error: Cannot write health report to unsafe location")
+            return
         
         with open(report_filename, 'w') as f:
             f.write(f"Media Library Health Report\n")
@@ -1884,7 +2908,7 @@ print(f"\\n✓ All conversions complete! Converted {{len(candidates)}} videos to
             print("0. Back to main menu")
             print()
             
-            choice = input("Enter your choice: ").strip()
+            choice = self.safe_input("Enter your choice: ")
             
             if choice == '0':
                 break
@@ -1948,7 +2972,7 @@ print(f"\\n✓ All conversions complete! Converted {{len(candidates)}} videos to
             for show_dir in os.listdir(tv_path):
                 show_path = os.path.join(tv_path, show_dir)
                 if os.path.isdir(show_path):
-                    for root, dirs, files in os.walk(show_path):
+                    for root, dirs, files in os.walk(show_path, followlinks=False):
                         for file in files:
                             if file.lower().endswith(self.video_extensions):
                                 tv_checked += 1
@@ -2045,7 +3069,7 @@ print(f"\\n✓ All conversions complete! Converted {{len(candidates)}} videos to
         if len(rename_candidates) > 10:
             print(f"... and {len(rename_candidates) - 10} more")
         
-        response = input("\nRename these movies? (y/N): ")
+        response = self.safe_input("\nRename these movies? (y/N): ")
         if response.lower() == 'y':
             renamed = 0
             for old_path, new_path, _, _ in rename_candidates:
@@ -2053,7 +3077,7 @@ print(f"\\n✓ All conversions complete! Converted {{len(candidates)}} videos to
                     os.rename(old_path, new_path)
                     renamed += 1
                 except OSError as e:
-                    print(f"Error renaming {old_path}: {e}")
+                    print(f"Error renaming {self.sanitize_path_for_display(old_path)}: {self.sanitize_error_message(str(e))}")
             print(f"✓ Renamed {renamed} movies")
         
         input("\nPress Enter to continue...")
@@ -2082,7 +3106,7 @@ print(f"\\n✓ All conversions complete! Converted {{len(candidates)}} videos to
         for show_dir in os.listdir(tv_path):
             show_path = os.path.join(tv_path, show_dir)
             if os.path.isdir(show_path):
-                for root, dirs, files in os.walk(show_path):
+                for root, dirs, files in os.walk(show_path, followlinks=False):
                     for file in files:
                         if file.lower().endswith(self.video_extensions):
                             file_path = os.path.join(root, file)
@@ -2092,8 +3116,11 @@ print(f"\\n✓ All conversions complete! Converted {{len(candidates)}} videos to
                             for pattern, format_str in patterns:
                                 match = re.search(pattern, file, re.IGNORECASE)
                                 if match:
-                                    season = int(match.group(1))
-                                    episode = int(match.group(2))
+                                    try:
+                                        season = int(match.group(1))
+                                        episode = int(match.group(2))
+                                    except (ValueError, IndexError):
+                                        continue
                                     
                                     # Create new name
                                     ext = os.path.splitext(file)[1]
@@ -2127,7 +3154,7 @@ print(f"\\n✓ All conversions complete! Converted {{len(candidates)}} videos to
             if len(episodes) > 3:
                 print(f"  ... and {len(episodes) - 3} more episodes")
         
-        response = input("\nRename these episodes? (y/N): ")
+        response = self.safe_input("\nRename these episodes? (y/N): ")
         if response.lower() == 'y':
             renamed = 0
             for old_path, new_path, _, _, _ in rename_candidates:
@@ -2135,7 +3162,7 @@ print(f"\\n✓ All conversions complete! Converted {{len(candidates)}} videos to
                     os.rename(old_path, new_path)
                     renamed += 1
                 except OSError as e:
-                    print(f"Error renaming {old_path}: {e}")
+                    print(f"Error renaming {self.sanitize_path_for_display(old_path)}: {self.sanitize_error_message(str(e))}")
             print(f"✓ Renamed {renamed} episodes")
         
         input("\nPress Enter to continue...")
@@ -2170,7 +3197,7 @@ print(f"\\n✓ All conversions complete! Converted {{len(candidates)}} videos to
         print("3. Auto-detect and organize")
         print("0. Cancel")
         
-        choice = input("\nEnter your choice: ").strip()
+        choice = self.safe_input("\nEnter your choice: ")
         
         if choice == '1':
             target = os.path.join(self.base_path, "Movies")
@@ -2243,8 +3270,11 @@ print(f"\\n✓ All conversions complete! Converted {{len(candidates)}} videos to
                         # Extract season number
                         match = re.search(r'[Ss](\d+)[Ee]\d+', item)
                         if match:
-                            season = int(match.group(1))
-                            loose_episodes.append((item_path, season, item))
+                            try:
+                                season = int(match.group(1))
+                                loose_episodes.append((item_path, season, item))
+                            except (ValueError, IndexError):
+                                continue
                 
                 if loose_episodes and not has_season_folders:
                     shows_to_fix.append((show_dir, loose_episodes))
@@ -2259,7 +3289,7 @@ print(f"\\n✓ All conversions complete! Converted {{len(candidates)}} videos to
             seasons = set(ep[1] for ep in episodes)
             print(f"  {show} - {len(episodes)} episodes across seasons {sorted(seasons)}")
         
-        response = input("\nCreate season folders and organize episodes? (y/N): ")
+        response = self.safe_input("\nCreate season folders and organize episodes? (y/N): ")
         if response.lower() == 'y':
             for show, episodes in shows_to_fix:
                 show_path = os.path.join(tv_path, show)
@@ -2295,7 +3325,7 @@ print(f"\\n✓ All conversions complete! Converted {{len(candidates)}} videos to
         orphaned_subs = []
         
         # Find subtitle files that might be in wrong locations
-        for root, dirs, files in os.walk(self.base_path):
+        for root, dirs, files in os.walk(self.base_path, followlinks=False):
             for file in files:
                 if any(file.lower().endswith(ext) for ext in subtitle_extensions):
                     sub_path = os.path.join(root, file)
@@ -2329,7 +3359,7 @@ print(f"\\n✓ All conversions complete! Converted {{len(candidates)}} videos to
             base_name = base_name.replace('.en', '').replace('.eng', '').replace('.english', '')
             
             # Search for matching video
-            for root, dirs, files in os.walk(self.base_path):
+            for root, dirs, files in os.walk(self.base_path, followlinks=False):
                 for file in files:
                     if file.lower().endswith(self.video_extensions):
                         video_base = os.path.splitext(file)[0]
@@ -2351,7 +3381,7 @@ print(f"\\n✓ All conversions complete! Converted {{len(candidates)}} videos to
             if len(matches) > 5:
                 print(f"... and {len(matches) - 5} more")
             
-            response = input("\nMove subtitle files to match videos? (y/N): ")
+            response = self.safe_input("\nMove subtitle files to match videos? (y/N): ")
             if response.lower() == 'y':
                 moved = 0
                 for old_path, new_path, _ in matches:
@@ -2359,7 +3389,7 @@ print(f"\\n✓ All conversions complete! Converted {{len(candidates)}} videos to
                         os.rename(old_path, new_path)
                         moved += 1
                     except OSError as e:
-                        print(f"Error moving {old_path}: {e}")
+                        print(f"Error moving {self.sanitize_path_for_display(old_path)}: {self.sanitize_error_message(str(e))}")
                 print(f"✓ Moved {moved} subtitle files")
         
         input("\nPress Enter to continue...")
@@ -2380,7 +3410,7 @@ print(f"\\n✓ All conversions complete! Converted {{len(candidates)}} videos to
             print("0. Back to main menu")
             print()
             
-            choice = input("Enter your choice: ").strip()
+            choice = self.safe_input("Enter your choice: ")
             
             if choice == '0':
                 break
@@ -2422,13 +3452,13 @@ print(f"\\n✓ All conversions complete! Converted {{len(candidates)}} videos to
         
         # Count files first
         print("Counting files...")
-        total_files = sum(1 for root, dirs, files in os.walk(self.base_path) 
+        total_files = sum(1 for root, dirs, files in os.walk(self.base_path, followlinks=False) 
                          for file in files if file.lower().endswith(self.video_extensions))
         
         print(f"Analyzing {total_files} video files...\n")
         files_processed = 0
         
-        for root, dirs, files in os.walk(self.base_path):
+        for root, dirs, files in os.walk(self.base_path, followlinks=False):
             for file in files:
                 if file.lower().endswith(self.video_extensions):
                     file_path = os.path.join(root, file)
@@ -2498,7 +3528,7 @@ print(f"\\n✓ All conversions complete! Converted {{len(candidates)}} videos to
         
         current_time = datetime.now()
         
-        for root, dirs, files in os.walk(self.base_path):
+        for root, dirs, files in os.walk(self.base_path, followlinks=False):
             for file in files:
                 if file.lower().endswith(self.video_extensions):
                     file_path = os.path.join(root, file)
@@ -2574,7 +3604,7 @@ print(f"\\n✓ All conversions complete! Converted {{len(candidates)}} videos to
         # Analyze growth over last 6 months
         monthly_sizes = defaultdict(int)
         
-        for root, dirs, files in os.walk(self.base_path):
+        for root, dirs, files in os.walk(self.base_path, followlinks=False):
             for file in files:
                 if file.lower().endswith(self.video_extensions):
                     file_path = os.path.join(root, file)
@@ -2650,7 +3680,7 @@ print(f"\\n✓ All conversions complete! Converted {{len(candidates)}} videos to
         all_videos = []
         show_sizes = defaultdict(int)
         
-        for root, dirs, files in os.walk(self.base_path):
+        for root, dirs, files in os.walk(self.base_path, followlinks=False):
             for file in files:
                 if file.lower().endswith(self.video_extensions):
                     file_path = os.path.join(root, file)
@@ -2702,8 +3732,8 @@ print(f"\\n✓ All conversions complete! Converted {{len(candidates)}} videos to
                 print(f"{i:2}. {size_gb:>6.2f} GB - {show}")
         
         # Files over certain thresholds
-        large_files = [v for v in all_videos if v['size'] > 5 * (1024**3)]  # Over 5GB
-        huge_files = [v for v in all_videos if v['size'] > 10 * (1024**3)]  # Over 10GB
+        large_files = [v for v in all_videos if v['size'] > FileSizeConstants.LARGE_FILE_THRESHOLD]  # Over 5GB
+        huge_files = [v for v in all_videos if v['size'] > FileSizeConstants.HUGE_FILE_THRESHOLD]  # Over 10GB
         
         print(f"\nSize Statistics:")
         print(f"  Files over 5 GB:  {len(large_files)}")
@@ -2728,7 +3758,7 @@ print(f"\\n✓ All conversions complete! Converted {{len(candidates)}} videos to
         # Find exact duplicates
         size_map = defaultdict(list)
         
-        for root, dirs, files in os.walk(self.base_path):
+        for root, dirs, files in os.walk(self.base_path, followlinks=False):
             for file in files:
                 if file.lower().endswith(self.video_extensions):
                     file_path = os.path.join(root, file)
@@ -2762,7 +3792,7 @@ print(f"\\n✓ All conversions complete! Converted {{len(candidates)}} videos to
         # Find large old files
         current_time = datetime.now()
         
-        for root, dirs, files in os.walk(self.base_path):
+        for root, dirs, files in os.walk(self.base_path, followlinks=False):
             for file in files:
                 if file.lower().endswith(self.video_extensions):
                     file_path = os.path.join(root, file)
@@ -2772,7 +3802,7 @@ print(f"\\n✓ All conversions complete! Converted {{len(candidates)}} videos to
                         mtime = datetime.fromtimestamp(stat.st_mtime)
                         
                         # Large files not accessed in over a year
-                        if size > 3 * (1024**3) and (current_time - mtime).days > 365:
+                        if size > 3 * FileSizeConstants.GB and (current_time - mtime).days > 365:
                             recommendations['large_old'].append({
                                 'path': file_path,
                                 'size': size,
@@ -2788,7 +3818,7 @@ print(f"\\n✓ All conversions complete! Converted {{len(candidates)}} videos to
                             })
                         
                         # Sample files
-                        if 'sample' in file.lower() and size < 100 * (1024**2):
+                        if 'sample' in file.lower() and size < FileSizeConstants.SAMPLE_FILE_MAX:
                             recommendations['samples'].append({
                                 'path': file_path,
                                 'size': size,
@@ -2830,9 +3860,11 @@ print(f"\\n✓ All conversions complete! Converted {{len(candidates)}} videos to
         
         # Save detailed report
         if total_recoverable > 0:
-            response = input("\nSave detailed deletion report? (y/N): ")
+            response = self.safe_input("\nSave detailed deletion report? (y/N): ")
             if response.lower() == 'y':
-                with open("deletion_recommendations.txt", "w") as f:
+                report_path = os.path.join(self.base_path, "deletion_recommendations.txt")
+                self.security_audit_log("REPORT_GENERATED", f"Deletion recommendations: {report_path}")
+                with open(report_path, "w") as f:
                     f.write(f"Deletion Recommendations - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
                     f.write("="*80 + "\n\n")
                     
@@ -2886,13 +3918,13 @@ print(f"\\n✓ All conversions complete! Converted {{len(candidates)}} videos to
         all_files = []
         
         # Count files for progress
-        total_files = sum(1 for root, dirs, files in os.walk(self.base_path) 
+        total_files = sum(1 for root, dirs, files in os.walk(self.base_path, followlinks=False) 
                          for file in files if file.lower().endswith(self.video_extensions))
         
         print(f"Processing {total_files} video files for detailed analytics...\n")
         files_processed = 0
         
-        for root, dirs, files in os.walk(self.base_path):
+        for root, dirs, files in os.walk(self.base_path, followlinks=False):
             for file in files:
                 if file.lower().endswith(self.video_extensions):
                     file_path = os.path.join(root, file)
@@ -2989,13 +4021,21 @@ print(f"\\n✓ All conversions complete! Converted {{len(candidates)}} videos to
         # Save reports
         timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
         
-        # JSON report
-        json_file = f"storage_analytics_{timestamp}.json"
+        # JSON report in secure location
+        json_file = os.path.join(self.base_path, f"storage_analytics_{timestamp}.json")
+        if not self.validate_safe_path(json_file):
+            print("Error: Cannot write analytics JSON to unsafe location")
+            return
+        
         with open(json_file, 'w') as f:
             json.dump(report_data, f, indent=2)
         
-        # Human-readable report
-        txt_file = f"storage_analytics_{timestamp}.txt"
+        # Human-readable report in secure location
+        txt_file = os.path.join(self.base_path, f"storage_analytics_{timestamp}.txt")
+        if not self.validate_safe_path(txt_file):
+            print("Error: Cannot write analytics report to unsafe location")
+            return
+        
         with open(txt_file, 'w') as f:
             f.write(f"Storage Analytics Report\n")
             f.write(f"Generated: {report_data['generated']}\n")
@@ -3076,26 +4116,85 @@ print(f"\\n✓ All conversions complete! Converted {{len(candidates)}} videos to
             print()
             
             try:
-                choice = input("Enter your choice: ").strip()
+                # Rate limiting check before processing menu choice
+                if not self.check_rate_limit("menu_operation"):
+                    time.sleep(2)  # Force a small delay before showing menu again
+                    continue
+                
+                choice = self.safe_input("Enter your choice: ")
                 
                 if choice == '1':
-                    self.background_analysis()
+                    if self.check_rate_limit("background_analysis"):
+                        try:
+                            self.background_analysis()
+                            self.reset_failure_count()
+                        except Exception as e:
+                            self.record_operation_failure("background_analysis")
+                            raise
                 elif choice == '2':
-                    self.inventory_videos()
+                    if self.check_rate_limit("inventory_videos"):
+                        try:
+                            self.inventory_videos()
+                            self.reset_failure_count()
+                        except Exception as e:
+                            self.record_operation_failure("inventory_videos")
+                            raise
                 elif choice == '3':
-                    self.list_conversion_candidates()
+                    if self.check_rate_limit("list_conversion_candidates"):
+                        try:
+                            self.list_conversion_candidates()
+                            self.reset_failure_count()
+                        except Exception as e:
+                            self.record_operation_failure("list_conversion_candidates")
+                            raise
                 elif choice == '4':
-                    self.top_shows_by_size()
+                    if self.check_rate_limit("top_shows_by_size"):
+                        try:
+                            self.top_shows_by_size()
+                            self.reset_failure_count()
+                        except Exception as e:
+                            self.record_operation_failure("top_shows_by_size")
+                            raise
                 elif choice == '5':
-                    self.top_video_files()
+                    if self.check_rate_limit("top_video_files"):
+                        try:
+                            self.top_video_files()
+                            self.reset_failure_count()
+                        except Exception as e:
+                            self.record_operation_failure("top_video_files")
+                            raise
                 elif choice == '6':
-                    self.library_health_check()
+                    if self.check_rate_limit("library_health_check"):
+                        try:
+                            self.library_health_check()
+                            self.reset_failure_count()
+                        except Exception as e:
+                            self.record_operation_failure("library_health_check")
+                            raise
                 elif choice == '7':
-                    self.storage_analytics()
+                    if self.check_rate_limit("storage_analytics"):
+                        try:
+                            self.storage_analytics()
+                            self.reset_failure_count()
+                        except Exception as e:
+                            self.record_operation_failure("storage_analytics")
+                            raise
                 elif choice == '8':
-                    self.convert_to_resolution(1080)
+                    if self.check_rate_limit("convert_to_1080p"):
+                        try:
+                            self.convert_to_resolution(1080)
+                            self.reset_failure_count()
+                        except Exception as e:
+                            self.record_operation_failure("convert_to_1080p")
+                            raise
                 elif choice == '9':
-                    self.convert_to_resolution(720)
+                    if self.check_rate_limit("convert_to_720p"):
+                        try:
+                            self.convert_to_resolution(720)
+                            self.reset_failure_count()
+                        except Exception as e:
+                            self.record_operation_failure("convert_to_720p")
+                            raise
                 elif choice == '10':
                     self.batch_operations()
                 elif choice == '11':
@@ -3119,14 +4218,14 @@ print(f"\\n✓ All conversions complete! Converted {{len(candidates)}} videos to
                     break
                 else:
                     print("Invalid choice. Please try again.")
-                    input("\nPress Enter to continue...")
+                    self.safe_input("\nPress Enter to continue...")
                     
             except KeyboardInterrupt:
                 print("\n\nGoodbye!")
                 break
-            except Exception as e:
-                print(f"\nError: {e}")
-                input("\nPress Enter to continue...")
+            except (ValueError, KeyError, TypeError, OSError, IOError) as e:
+                print(f"\nError: {self.sanitize_error_message(str(e))}")
+                self.safe_input("\nPress Enter to continue...")
         
     def batch_operations(self):
         """Batch operations menu for bulk actions."""
@@ -3144,7 +4243,7 @@ print(f"\\n✓ All conversions complete! Converted {{len(candidates)}} videos to
             print("0. Back to main menu")
             print()
             
-            choice = input("Enter your choice: ").strip()
+            choice = self.safe_input("Enter your choice: ")
             
             if choice == '0':
                 break
@@ -3171,7 +4270,7 @@ print(f"\\n✓ All conversions complete! Converted {{len(candidates)}} videos to
         print("5. Convert specific codec to another")
         print("0. Back")
         
-        choice = input("\nEnter your choice: ").strip()
+        choice = self.safe_input("\nEnter your choice: ")
         
         if choice == '1':
             self.batch_convert_codec('hevc', 'h264')
@@ -3182,8 +4281,8 @@ print(f"\\n✓ All conversions complete! Converted {{len(candidates)}} videos to
         elif choice == '4':
             self.batch_fix_audio_codecs()
         elif choice == '5':
-            from_codec = input("From codec (e.g., hevc, h264): ").strip().lower()
-            to_codec = input("To codec (e.g., h264, hevc): ").strip().lower()
+            from_codec = self.safe_input("From codec (e.g., hevc, h264): ").lower()
+            to_codec = self.safe_input("To codec (e.g., h264, hevc): ").lower()
             if from_codec and to_codec:
                 self.batch_convert_codec(from_codec, to_codec)
                 
@@ -3197,7 +4296,7 @@ print(f"\\n✓ All conversions complete! Converted {{len(candidates)}} videos to
         print("5. Convert videos larger than X GB")
         print("0. Back")
         
-        choice = input("\nEnter your choice: ").strip()
+        choice = self.safe_input("\nEnter your choice: ")
         
         if choice == '1':
             self.batch_delete_by_resolution(720)
@@ -3206,13 +4305,13 @@ print(f"\\n✓ All conversions complete! Converted {{len(candidates)}} videos to
         elif choice == '3':
             self.batch_convert_4k_to_1080p()
         elif choice == '4':
-            min_mb = input("Delete files smaller than (MB): ").strip()
+            min_mb = self.safe_input("Delete files smaller than (MB): ")
             try:
                 self.batch_delete_by_size(int(min_mb))
             except ValueError:
                 print("Invalid size!")
         elif choice == '5':
-            max_gb = input("Convert files larger than (GB): ").strip()
+            max_gb = self.safe_input("Convert files larger than (GB): ")
             try:
                 self.batch_convert_large_files(float(max_gb))
             except ValueError:
@@ -3227,20 +4326,20 @@ print(f"\\n✓ All conversions complete! Converted {{len(candidates)}} videos to
         print("4. Batch rename using pattern")
         print("0. Back")
         
-        choice = input("\nEnter your choice: ").strip()
+        choice = self.safe_input("\nEnter your choice: ")
         
         if choice == '1':
-            text_to_remove = input("Text to remove from filenames: ").strip()
+            text_to_remove = self.safe_input("Text to remove from filenames: ")
             if text_to_remove:
                 self.batch_remove_text(text_to_remove)
         elif choice == '2':
-            from_ext = input("From extension (e.g., .avi): ").strip()
-            to_ext = input("To extension (e.g., .mp4): ").strip()
+            from_ext = self.safe_input("From extension (e.g., .avi): ")
+            to_ext = self.safe_input("To extension (e.g., .mp4): ")
             if from_ext and to_ext:
                 self.batch_change_extensions(from_ext, to_ext)
         elif choice == '3':
-            pattern = input("File pattern to match: ").strip()
-            folder = input("Destination folder: ").strip()
+            pattern = self.safe_input("File pattern to match: ")
+            folder = self.safe_input("Destination folder: ")
             if pattern and folder:
                 self.batch_move_by_pattern(pattern, folder)
         elif choice == '4':
@@ -3256,7 +4355,7 @@ print(f"\\n✓ All conversions complete! Converted {{len(candidates)}} videos to
         print("5. Remove all external subtitle files")
         print("0. Back")
         
-        choice = input("\nEnter your choice: ").strip()
+        choice = self.safe_input("\nEnter your choice: ")
         
         if choice == '1':
             self.batch_extract_subtitles()
@@ -3265,7 +4364,7 @@ print(f"\\n✓ All conversions complete! Converted {{len(candidates)}} videos to
         elif choice == '3':
             self.batch_convert_subtitle_formats()
         elif choice == '4':
-            show_name = input("Show name (partial match): ").strip()
+            show_name = self.safe_input("Show name (partial match): ")
             if show_name:
                 self.batch_download_show_subtitles(show_name)
         elif choice == '5':
@@ -3279,7 +4378,7 @@ print(f"\\n✓ All conversions complete! Converted {{len(candidates)}} videos to
         print("3. Remove all chapters from videos")
         print("0. Back")
         
-        choice = input("\nEnter your choice: ").strip()
+        choice = self.safe_input("\nEnter your choice: ")
         
         if choice == '1':
             self.batch_strip_metadata()
@@ -3298,22 +4397,22 @@ print(f"\\n✓ All conversions complete! Converted {{len(candidates)}} videos to
         print("5. Select by codec type")
         print("0. Back")
         
-        choice = input("\nEnter your choice: ").strip()
+        choice = self.safe_input("\nEnter your choice: ")
         
         if choice == '1':
             self.select_by_size_range()
         elif choice == '2':
             self.select_by_date_range()
         elif choice == '3':
-            pattern = input("Regex pattern: ").strip()
+            pattern = self.safe_input("Regex pattern: ")
             if pattern:
                 self.select_by_regex(pattern)
         elif choice == '4':
-            directory = input("Directory path: ").strip()
+            directory = self.safe_path_input("Directory path: ")
             if directory:
                 self.select_by_directory(directory)
         elif choice == '5':
-            codec = input("Codec name: ").strip()
+            codec = self.safe_input("Codec name: ")
             if codec:
                 self.select_by_codec(codec)
     
@@ -3323,12 +4422,12 @@ print(f"\\n✓ All conversions complete! Converted {{len(candidates)}} videos to
         print(f"\nFinding videos with {from_codec.upper()} codec...")
         
         matching_files = []
-        total_files = sum(1 for root, dirs, files in os.walk(self.base_path) 
+        total_files = sum(1 for root, dirs, files in os.walk(self.base_path, followlinks=False) 
                          for file in files if file.lower().endswith(self.video_extensions))
         
         files_checked = 0
         
-        for root, dirs, files in os.walk(self.base_path):
+        for root, dirs, files in os.walk(self.base_path, followlinks=False):
             for file in files:
                 if file.lower().endswith(self.video_extensions):
                     file_path = os.path.join(root, file)
@@ -3366,7 +4465,7 @@ print(f"\\n✓ All conversions complete! Converted {{len(candidates)}} videos to
         if len(matching_files) > 10:
             print(f"... and {len(matching_files) - 10} more")
         
-        response = input(f"\nConvert these videos from {from_codec.upper()} to {to_codec.upper()}? (y/N): ")
+        response = self.safe_input(f"\nConvert these videos from {from_codec.upper()} to {to_codec.upper()}? (y/N): ")
         if response.lower() == 'y':
             self.execute_batch_conversion(matching_files, to_codec)
             
@@ -3376,7 +4475,7 @@ print(f"\\n✓ All conversions complete! Converted {{len(candidates)}} videos to
         
         matching_files = []
         
-        for root, dirs, files in os.walk(self.base_path):
+        for root, dirs, files in os.walk(self.base_path, followlinks=False):
             for file in files:
                 if file.lower().endswith(from_ext.lower()):
                     file_path = os.path.join(root, file)
@@ -3403,7 +4502,7 @@ print(f"\\n✓ All conversions complete! Converted {{len(candidates)}} videos to
         if len(matching_files) > 10:
             print(f"... and {len(matching_files) - 10} more")
         
-        response = input(f"\nConvert these files to {to_ext}? (y/N): ")
+        response = self.safe_input(f"\nConvert these files to {to_ext}? (y/N): ")
         if response.lower() == 'y':
             for i, file_info in enumerate(matching_files, 1):
                 print(f"\n[{i}/{len(matching_files)}] Converting {file_info['name']}")
@@ -3411,13 +4510,18 @@ print(f"\\n✓ All conversions complete! Converted {{len(candidates)}} videos to
                 input_path = file_info['path']
                 output_path = os.path.splitext(input_path)[0] + to_ext
                 
+                # Validate file paths before FFmpeg command
+                if not self.validate_safe_path(input_path) or not self.validate_safe_path(output_path):
+                    print(f"✗ Skipping unsafe file path: {self.sanitize_path_for_display(file_info['name'])}")
+                    continue
+                
                 cmd = [
                     "ffmpeg", "-i", input_path,
                     "-c:v", "libx264", "-c:a", "aac",
                     "-y", output_path
                 ]
                 
-                result = subprocess.run(cmd, capture_output=True)
+                result = subprocess.run(cmd, capture_output=True, timeout=TimeoutConstants.LONG)
                 if result.returncode == 0:
                     backup_path = f"{os.path.splitext(input_path)[0]}-ORIGINAL{from_ext}"
                     os.rename(input_path, backup_path)
@@ -3434,12 +4538,12 @@ print(f"\\n✓ All conversions complete! Converted {{len(candidates)}} videos to
         print(f"\nFinding videos below {min_height}p...")
         
         low_res_files = []
-        total_files = sum(1 for root, dirs, files in os.walk(self.base_path) 
+        total_files = sum(1 for root, dirs, files in os.walk(self.base_path, followlinks=False) 
                          for file in files if file.lower().endswith(self.video_extensions))
         
         files_checked = 0
         
-        for root, dirs, files in os.walk(self.base_path):
+        for root, dirs, files in os.walk(self.base_path, followlinks=False):
             for file in files:
                 if file.lower().endswith(self.video_extensions):
                     file_path = os.path.join(root, file)
@@ -3480,17 +4584,17 @@ print(f"\\n✓ All conversions complete! Converted {{len(candidates)}} videos to
             print(f"... and {len(low_res_files) - 15} more")
         
         print(f"\n⚠️  WARNING: This will permanently delete {len(low_res_files)} files!")
-        response = input("Are you sure? Type 'DELETE' to confirm: ")
+        response = self.safe_input("Are you sure? Type 'DELETE' to confirm: ")
         
         if response == 'DELETE':
             deleted = 0
             for file_info in low_res_files:
-                try:
-                    os.remove(file_info['path'])
+                success, message = self.safe_file_delete(file_info['path'])
+                if success:
                     deleted += 1
                     print(f"Deleted: {file_info['name']}")
-                except OSError as e:
-                    print(f"Error deleting {file_info['name']}: {e}")
+                else:
+                    print(f"Error deleting {file_info['name']}: {message}")
             
             print(f"\n✓ Deleted {deleted} low-resolution videos")
             print(f"Freed up {total_size:.2f} GB of space")
@@ -3503,7 +4607,7 @@ print(f"\\n✓ All conversions complete! Converted {{len(candidates)}} videos to
         
         files_to_rename = []
         
-        for root, dirs, files in os.walk(self.base_path):
+        for root, dirs, files in os.walk(self.base_path, followlinks=False):
             for file in files:
                 if (file.lower().endswith(self.video_extensions) and 
                     text_to_remove in file):
@@ -3529,7 +4633,7 @@ print(f"\\n✓ All conversions complete! Converted {{len(candidates)}} videos to
         if len(files_to_rename) > 10:
             print(f"... and {len(files_to_rename) - 10} more")
         
-        response = input("\nRename these files? (y/N): ")
+        response = self.safe_input("\nRename these files? (y/N): ")
         if response.lower() == 'y':
             renamed = 0
             for old_path, new_path, _, _ in files_to_rename:
@@ -3537,7 +4641,7 @@ print(f"\\n✓ All conversions complete! Converted {{len(candidates)}} videos to
                     os.rename(old_path, new_path)
                     renamed += 1
                 except OSError as e:
-                    print(f"Error renaming {old_path}: {e}")
+                    print(f"Error renaming {self.sanitize_path_for_display(old_path)}: {self.sanitize_error_message(str(e))}")
             
             print(f"✓ Renamed {renamed} files")
         
@@ -3548,12 +4652,12 @@ print(f"\\n✓ All conversions complete! Converted {{len(candidates)}} videos to
         print("\nFinding videos with embedded English subtitles...")
         
         videos_with_subs = []
-        total_files = sum(1 for root, dirs, files in os.walk(self.base_path) 
+        total_files = sum(1 for root, dirs, files in os.walk(self.base_path, followlinks=False) 
                          for file in files if file.lower().endswith(self.video_extensions))
         
         files_checked = 0
         
-        for root, dirs, files in os.walk(self.base_path):
+        for root, dirs, files in os.walk(self.base_path, followlinks=False):
             for file in files:
                 if file.lower().endswith(self.video_extensions):
                     file_path = os.path.join(root, file)
@@ -3577,7 +4681,7 @@ print(f"\\n✓ All conversions complete! Converted {{len(candidates)}} videos to
             return
         
         print(f"\n\nFound {len(videos_with_subs)} videos with embedded subtitles")
-        response = input("Extract subtitles to .srt files? (y/N): ")
+        response = self.safe_input("Extract subtitles to .srt files? (y/N): ")
         
         if response.lower() == 'y':
             extracted = 0
@@ -3585,14 +4689,30 @@ print(f"\\n✓ All conversions complete! Converted {{len(candidates)}} videos to
                 print(f"\n[{i}/{len(videos_with_subs)}] Extracting from: {filename}")
                 
                 output_srt = os.path.splitext(file_path)[0] + '.srt'
+                
+                # Validate file paths before FFmpeg command
+                if not self.validate_safe_path(file_path) or not self.validate_safe_path(output_srt):
+                    print(f"✗ Skipping unsafe file path: {self.sanitize_path_for_display(filename)}")
+                    continue
+                
+                # Validate stream index to prevent injection
+                try:
+                    stream_idx = int(stream_index)
+                    if stream_idx < 0 or stream_idx > 99:  # Reasonable bounds for subtitle streams
+                        print(f"✗ Invalid stream index: {stream_index}")
+                        continue
+                except (ValueError, TypeError):
+                    print(f"✗ Invalid stream index: {stream_index}")
+                    continue
+                
                 cmd = [
                     "ffmpeg", "-i", file_path,
-                    "-map", f"0:s:{stream_index}",
+                    "-map", f"0:s:{stream_idx}",
                     "-c:s", "srt",
                     "-y", output_srt
                 ]
                 
-                result = subprocess.run(cmd, capture_output=True)
+                result = subprocess.run(cmd, capture_output=True, timeout=TimeoutConstants.MEDIUM)  # 5 minute timeout for subtitle extraction
                 if result.returncode == 0:
                     extracted += 1
                     print(f"     ✓ Extracted to {os.path.basename(output_srt)}")
@@ -3608,9 +4728,9 @@ print(f"\\n✓ All conversions complete! Converted {{len(candidates)}} videos to
         print(f"\nFinding videos smaller than {min_size_mb} MB...")
         
         small_files = []
-        min_bytes = min_size_mb * 1024 * 1024
+        min_bytes = min_size_mb * FileSizeConstants.MB
         
-        for root, dirs, files in os.walk(self.base_path):
+        for root, dirs, files in os.walk(self.base_path, followlinks=False):
             for file in files:
                 if file.lower().endswith(self.video_extensions):
                     file_path = os.path.join(root, file)
@@ -3635,15 +4755,15 @@ print(f"\\n✓ All conversions complete! Converted {{len(candidates)}} videos to
             print(f"  {file_info['name']} ({file_info['size_mb']:.1f} MB)")
         
         print(f"\n⚠️  WARNING: This will permanently delete {len(small_files)} files!")
-        response = input("Are you sure? Type 'DELETE' to confirm: ")
+        response = self.safe_input("Are you sure? Type 'DELETE' to confirm: ")
         
         if response == 'DELETE':
             for file_info in small_files:
-                try:
-                    os.remove(file_info['path'])
+                success, message = self.safe_file_delete(file_info['path'])
+                if success:
                     print(f"Deleted: {file_info['name']}")
-                except OSError as e:
-                    print(f"Error deleting {file_info['name']}: {e}")
+                else:
+                    print(f"Error deleting {file_info['name']}: {message}")
             
             print(f"\n✓ Deleted {len(small_files)} small videos")
         
@@ -3665,7 +4785,7 @@ print(f"\\n✓ All conversions complete! Converted {{len(candidates)}} videos to
             print(f"📋 Found recent analysis from {age_hours:.1f} hours ago")
             print(f"   Files analyzed: {len(cached['videos'])}")
             
-            use_cached = input("Use cached analysis? (Y/n): ").strip()
+            use_cached = self.safe_input("Use cached analysis? (Y/n): ")
             if use_cached.lower() != 'n':
                 self.display_analysis_results(cached)
                 return
@@ -3676,7 +4796,7 @@ print(f"\\n✓ All conversions complete! Converted {{len(candidates)}} videos to
         print("3. View previous analysis reports")
         print("0. Cancel")
         
-        choice = input("Select option: ").strip()
+        choice = self.safe_input("Select option: ")
         
         if choice == '0':
             return
@@ -3696,7 +4816,7 @@ print(f"\\n✓ All conversions complete! Converted {{len(candidates)}} videos to
         
         start_time = time.time()
         
-        # Initialize analysis results
+        # Initialize analysis results with real-time issue tracking
         analysis_results = {
             'files_scanned': 0,
             'total_files': 0,
@@ -3707,9 +4827,27 @@ print(f"\\n✓ All conversions complete! Converted {{len(candidates)}} videos to
             'large_files': [],
             'codec_issues': [],
             'duplicate_candidates': [],
+            'corrupted_files': [],
             'storage_usage': {},
-            'recommendations': []
+            'recommendations': [],
+            'background_tasks': []
         }
+        
+        # Real-time issue discovery tracking
+        found_issues = {
+            'subtitle_issues': [],
+            'system_files_found': [],
+            'naming_problems': [],
+            'codec_problems': [],
+            'corrupted_files': [],
+            'background_tasks': []
+        }
+        
+        # Ask about auto-fix options
+        print("🔧 Auto-fix options:")
+        auto_download_subs = self.safe_input("Auto-download missing subtitles in background? (y/N): ").lower() == 'y'
+        auto_remove_system = self.safe_input("Auto-remove system files (.DS_Store, etc.)? (y/N): ").lower() == 'y'
+        check_corruption = self.safe_input("Check for corrupted video files? (y/N): ").lower() == 'y'
         
         # Progress tracking variables
         progress = {
@@ -3717,18 +4855,33 @@ print(f"\\n✓ All conversions complete! Converted {{len(candidates)}} videos to
             'resolution_analysis': {'current': 0, 'total': 0, 'complete': False},
             'subtitle_check': {'current': 0, 'total': 0, 'complete': False},
             'naming_analysis': {'current': 0, 'total': 0, 'complete': False},
-            'codec_analysis': {'current': 0, 'total': 0, 'complete': False}
+            'codec_analysis': {'current': 0, 'total': 0, 'complete': False},
+            'corruption_check': {'current': 0, 'total': 0, 'complete': False}
         }
         
+        if not check_corruption:
+            with self._progress_lock:
+                progress['corruption_check']['complete'] = True
+        
         def update_progress_display():
-            """Update progress bars in real-time."""
-            while not all(p['complete'] for p in progress.values()):
+            """Update progress bars with real-time issue discovery."""
+            while True:
+                with self._progress_lock:
+                    all_complete = all(p['complete'] for p in progress.values())
+                    if all_complete:
+                        break
+                    
+                    progress_copy = {}
+                    for task, data in progress.items():
+                        progress_copy[task] = data.copy()
+                
                 print("\033[2J\033[H")  # Clear screen and go to top
                 print("="*60)
                 print("🔍 Background Analysis in Progress...")
                 print("="*60)
                 
-                for task, data in progress.items():
+                # Progress bars
+                for task, data in progress_copy.items():
                     if data['total'] > 0:
                         pct = (data['current'] / data['total']) * 100
                         filled = int(pct / 2)
@@ -3740,7 +4893,48 @@ print(f"\\n✓ All conversions complete! Converted {{len(candidates)}} videos to
                         task_name = task.replace('_', ' ').title()
                         print(f"⏳ {task_name:<20} [{'░' * 50}]   0.0% (0/0)")
                 
-                time.sleep(0.5)
+                # Real-time issue discovery
+                if any(found_issues.values()):
+                    print("\n🚨 ISSUES FOUND:")
+                    
+                    if found_issues['subtitle_issues']:
+                        recent_subs = found_issues['subtitle_issues'][-3:]  # Show last 3
+                        for issue in recent_subs:
+                            print(f"   📝 {issue}")
+                        if len(found_issues['subtitle_issues']) > 3:
+                            print(f"   ... and {len(found_issues['subtitle_issues']) - 3} more")
+                    
+                    if found_issues['system_files_found']:
+                        print(f"   🗑️  System files: {len(found_issues['system_files_found'])}")
+                    
+                    if found_issues['naming_problems']:
+                        recent_naming = found_issues['naming_problems'][-2:]
+                        for issue in recent_naming:
+                            print(f"   📂 {issue}")
+                    
+                    if found_issues['codec_problems']:
+                        print(f"   🎬 Old codecs: {len(found_issues['codec_problems'])}")
+                    
+                    if found_issues['corrupted_files']:
+                        recent_corrupt = found_issues['corrupted_files'][-2:]
+                        for issue in recent_corrupt:
+                            print(f"   💥 {issue}")
+                
+                # Active background tasks
+                if self.active_tasks:
+                    print(f"\n⚡ ACTIVE TASKS ({len(self.active_tasks)}/{self.max_concurrent_tasks}):")
+                    for task_id, task in self.active_tasks.items():
+                        elapsed = time.time() - task['started_at']
+                        print(f"   🔧 Task {task_id}: {task['description']} ({elapsed:.1f}s)")
+                
+                # Completed tasks (show last few)
+                if found_issues['background_tasks']:
+                    recent_completed = found_issues['background_tasks'][-3:]
+                    print(f"\n✅ COMPLETED TASKS:")
+                    for task_result in recent_completed:
+                        print(f"   {task_result}")
+                
+                time.sleep(0.5 + random.uniform(0, 0.1))  # Add jitter to prevent timing attacks
         
         # Start progress display in background thread
         progress_thread = threading.Thread(target=update_progress_display, daemon=True)
@@ -3755,7 +4949,7 @@ print(f"\\n✓ All conversions complete! Converted {{len(candidates)}} videos to
         all_video_files = []
         files_to_analyze = []
         
-        for root, dirs, files in os.walk(self.base_path):
+        for root, dirs, files in os.walk(self.base_path, followlinks=False):
             for file in files:
                 if file.lower().endswith(self.video_extensions):
                     file_path = os.path.join(root, file)
@@ -3765,7 +4959,8 @@ print(f"\\n✓ All conversions complete! Converted {{len(candidates)}} videos to
                     if not incremental_mode or self.is_file_changed(file_path):
                         files_to_analyze.append(file_path)
         
-        progress['file_scan']['total'] = len(all_video_files)
+        with self._progress_lock:
+            progress['file_scan']['total'] = len(all_video_files)
         analysis_results['total_files'] = len(all_video_files)
         
         if incremental_mode:
@@ -3774,15 +4969,18 @@ print(f"\\n✓ All conversions complete! Converted {{len(candidates)}} videos to
             files_to_analyze = all_video_files
         
         for i, file_path in enumerate(all_video_files):
-            progress['file_scan']['current'] = i + 1
+            with self._progress_lock:
+                progress['file_scan']['current'] = i + 1
             analysis_results['files_scanned'] = i + 1
-            time.sleep(0.001)
+            time.sleep(0.001 + random.uniform(0, 0.0005))  # Jitter for timing attack prevention
         
-        progress['file_scan']['complete'] = True
+        with self._progress_lock:
+            progress['file_scan']['complete'] = True
         
         # Phase 2: Load cached data and analyze new/changed files
-        progress['resolution_analysis']['total'] = len(files_to_analyze)
-        progress['codec_analysis']['total'] = len(files_to_analyze)
+        with self._progress_lock:
+            progress['resolution_analysis']['total'] = len(files_to_analyze)
+            progress['codec_analysis']['total'] = len(files_to_analyze)
         
         # Load existing data from database for unchanged files
         if incremental_mode:
@@ -3831,8 +5029,9 @@ print(f"\\n✓ All conversions complete! Converted {{len(candidates)}} videos to
         
         # Analyze only new/changed files
         for i, file_path in enumerate(files_to_analyze):
-            progress['resolution_analysis']['current'] = i + 1
-            progress['codec_analysis']['current'] = i + 1
+            with self._progress_lock:
+                progress['resolution_analysis']['current'] = i + 1
+                progress['codec_analysis']['current'] = i + 1
             
             try:
                 # Get file stats
@@ -3946,29 +5145,84 @@ print(f"\\n✓ All conversions complete! Converted {{len(candidates)}} videos to
                 
                 if not has_external_subs and not has_embedded_subs:
                     analysis_results['missing_subtitles'].append(file_path)
+                    found_issues['subtitle_issues'].append(f"Missing subtitles: {os.path.basename(file_path)}")
+                    
+                    # Auto-queue subtitle download if enabled
+                    if auto_download_subs and len(self.active_tasks) < self.max_concurrent_tasks:
+                        task_desc = f"Download subtitles for {os.path.basename(file_path)}"
+                        self.add_background_task('subtitle', file_path, self.download_subtitle_task, task_desc)
+                
+                # Check for naming issues and report
+                if issues:
+                    issue_desc = f"{os.path.basename(file_path)}: {', '.join(issues[:2])}"
+                    found_issues['naming_problems'].append(issue_desc)
+                
+                # Report codec issues
+                if file_data.get('codec') in ['mpeg4', 'xvid', 'divx', 'wmv3']:
+                    found_issues['codec_problems'].append(f"{os.path.basename(file_path)}: {file_data['codec']}")
                 
                 # Save to database
                 self.save_video_metadata(file_data)
                 
-            except Exception as e:
-                print(f"Error analyzing {file_path}: {e}")
+            except (OSError, IOError, ValueError, subprocess.SubprocessError) as e:
+                print(f"Error analyzing {file_path}: {self.sanitize_error_message(str(e))}")
                 continue
             
-            time.sleep(0.001)
+            time.sleep(0.001 + random.uniform(0, 0.0005))  # Jitter for timing attack prevention
         
-        progress['resolution_analysis']['complete'] = True
-        progress['codec_analysis']['complete'] = True
-        progress['naming_analysis']['complete'] = True
-        progress['subtitle_check']['complete'] = True
+        with self._progress_lock:
+            progress['resolution_analysis']['complete'] = True
+            progress['codec_analysis']['complete'] = True
+            progress['naming_analysis']['complete'] = True
+            progress['subtitle_check']['complete'] = True
+        
+        # Phase 3: Corruption checking (if enabled)
+        if check_corruption:
+            with self._progress_lock:
+                progress['corruption_check']['total'] = len(files_to_analyze)
+            
+            # Check for corruption on files that had analysis issues
+            corruption_candidates = []
+            for file_path in files_to_analyze:
+                # Only check files that might be problematic
+                if (file_path in [f['path'] for f in analysis_results['conversion_candidates']] or
+                    any(os.path.basename(file_path) in issue for issue in found_issues['codec_problems'])):
+                    corruption_candidates.append(file_path)
+            
+            for i, file_path in enumerate(corruption_candidates):
+                with self._progress_lock:
+                    progress['corruption_check']['current'] = i + 1
+                
+                # Queue corruption check as background task
+                if len(self.active_tasks) < self.max_concurrent_tasks:
+                    task_desc = f"Check integrity: {os.path.basename(file_path)}"
+                    self.add_background_task('corruption', file_path, self.check_video_corruption_task, task_desc)
+                
+                time.sleep(0.001 + random.uniform(0, 0.0005))  # Jitter for timing attack prevention
+        
+        with self._progress_lock:
+            progress['corruption_check']['complete'] = True
         
         # Wait for progress display to finish
-        time.sleep(1)
+        time.sleep(1 + random.uniform(0, 0.2))  # Add jitter to prevent timing attacks
         
-        # Scan for system files
-        for root, dirs, files in os.walk(self.base_path):
+        # Scan for system files with auto-remove option
+        print("\n🗑️  Scanning for system files...")
+        for root, dirs, files in os.walk(self.base_path, followlinks=False):
             for file in files:
                 if file in ['.DS_Store', 'Thumbs.db', 'desktop.ini'] or file.startswith('._'):
-                    analysis_results['system_files'].append(os.path.join(root, file))
+                    file_path = os.path.join(root, file)
+                    analysis_results['system_files'].append(file_path)
+                    found_issues['system_files_found'].append(f"System file: {os.path.relpath(file_path, self.base_path)}")
+                    
+                    # Auto-queue removal if enabled
+                    if auto_remove_system and len(self.active_tasks) < self.max_concurrent_tasks:
+                        task_desc = f"Remove system file: {file}"
+                        self.add_background_task('cleanup', file_path, self.remove_system_file_task, task_desc)
+        
+        # Process any queued background tasks
+        if not self.task_queue.empty():
+            self.process_background_tasks(found_issues)
         
         # Calculate analysis duration
         analysis_duration = time.time() - start_time
@@ -4032,7 +5286,7 @@ print(f"\\n✓ All conversions complete! Converted {{len(candidates)}} videos to
             recommendations
         )
         
-        # Display results
+        # Display results with background task info
         self.display_analysis_results({
             'session': {
                 'timestamp': time.time(),
@@ -4040,7 +5294,9 @@ print(f"\\n✓ All conversions complete! Converted {{len(candidates)}} videos to
                 'files_analyzed': len(files_to_analyze),
                 'duration_seconds': analysis_duration
             },
-            'analysis_results': analysis_results
+            'analysis_results': analysis_results,
+            'found_issues': found_issues,
+            'background_tasks_completed': len(self.completed_tasks)
         })
     
     def display_analysis_results(self, data):
@@ -4062,6 +5318,11 @@ print(f"\\n✓ All conversions complete! Converted {{len(candidates)}} videos to
         print(f"🔍 Files Analyzed: {session['files_analyzed']:,}")
         print(f"⏱️  Analysis Time: {session['duration_seconds']:.1f} seconds")
         print(f"📅 Timestamp: {datetime.fromtimestamp(session['timestamp']).strftime('%Y-%m-%d %H:%M:%S')}")
+        
+        # Show background task summary if available
+        if 'background_tasks_completed' in data:
+            print(f"🔧 Background Tasks: {data['background_tasks_completed']} completed")
+        
         print()
         
         # Summary statistics
@@ -4073,6 +5334,9 @@ print(f"\\n✓ All conversions complete! Converted {{len(candidates)}} videos to
         print(f"Videos with codec issues: {len(results['codec_issues'])}")
         print(f"Large files (>10GB): {len(results['large_files'])}")
         print(f"System files to clean: {len(results['system_files'])}")
+        
+        if 'corrupted_files' in results:
+            print(f"Corrupted/problematic files: {len(results['corrupted_files'])}")
         print()
         
         # Recommendations
@@ -4126,6 +5390,34 @@ print(f"\\n✓ All conversions complete! Converted {{len(candidates)}} videos to
                 print(f"{i:2}. {filename[:50]}")
                 print(f"    Issues: {issues_str}")
         
+        # Show real-time issue discovery summary if available
+        if 'found_issues' in data:
+            found = data['found_issues']
+            if any(found.values()):
+                print(f"\n🔍 REAL-TIME DISCOVERY SUMMARY")
+                print("-" * 40)
+                
+                if found['subtitle_issues']:
+                    print(f"📝 Subtitle issues discovered: {len(found['subtitle_issues'])}")
+                
+                if found['system_files_found']:
+                    print(f"🗑️  System files found: {len(found['system_files_found'])}")
+                
+                if found['naming_problems']:
+                    print(f"📂 Naming problems detected: {len(found['naming_problems'])}")
+                
+                if found['codec_problems']:
+                    print(f"🎬 Old codec files found: {len(found['codec_problems'])}")
+                
+                if found['corrupted_files']:
+                    print(f"💥 Corrupted files detected: {len(found['corrupted_files'])}")
+                
+                if found['background_tasks']:
+                    print(f"⚡ Auto-fix tasks completed: {len(found['background_tasks'])}")
+                    print("Recent completions:")
+                    for task_result in found['background_tasks'][-5:]:
+                        print(f"   {task_result}")
+        
         input("\nPress Enter to continue...")
     
     def rebuild_analysis_from_db(self):
@@ -4177,7 +5469,7 @@ print(f"\\n✓ All conversions complete! Converted {{len(candidates)}} videos to
                 })
             
             # Get large files
-            cursor.execute('SELECT * FROM video_files WHERE file_size > ?', (10 * 1024**3,))
+            cursor.execute('SELECT * FROM video_files WHERE file_size > ?', (FileSizeConstants.HUGE_FILE_THRESHOLD,))
             for row in cursor.fetchall():
                 results['large_files'].append({
                     'path': row['file_path'],
@@ -4189,7 +5481,7 @@ print(f"\\n✓ All conversions complete! Converted {{len(candidates)}} videos to
             conn.close()
             
         # Scan for system files (not cached)
-        for root, dirs, files in os.walk(self.base_path):
+        for root, dirs, files in os.walk(self.base_path, followlinks=False):
             for file in files:
                 if file in ['.DS_Store', 'Thumbs.db', 'desktop.ini'] or file.startswith('._'):
                     results['system_files'].append(os.path.join(root, file))
@@ -4226,11 +5518,21 @@ print(f"\\n✓ All conversions complete! Converted {{len(candidates)}} videos to
                 print(f"    Files: {session['files_analyzed']}/{session['total_files']}")
                 print(f"    Duration: {session['duration_seconds']:.1f}s")
                 if session['recommendations']:
-                    rec_count = len(json.loads(session['recommendations']))
-                    print(f"    Recommendations: {rec_count}")
+                    try:
+                        # Safe JSON parsing with size limit to prevent DoS
+                        if len(session['recommendations']) > FileSizeConstants.MB:  # 1MB limit
+                            self.security_audit_log("JSON_PARSE_ERROR", "Recommendations JSON too large")
+                            print(f"    Recommendations: [Error: Too large]")
+                        else:
+                            recommendations = json.loads(session['recommendations'])
+                            rec_count = len(recommendations)
+                            print(f"    Recommendations: {rec_count}")
+                    except (json.JSONDecodeError, ValueError) as e:
+                        self.security_audit_log("JSON_PARSE_ERROR", f"Failed to parse recommendations JSON: {e}")
+                        print(f"    Recommendations: [Parse Error]")
                 print()
             
-            choice = input("Select session to view (or 0 to cancel): ").strip()
+            choice = self.safe_input("Select session to view (or 0 to cancel): ")
             
             if choice == '0':
                 return
@@ -4256,7 +5558,7 @@ print(f"\\n✓ All conversions complete! Converted {{len(candidates)}} videos to
     def check_rclone_installed(self):
         """Check if rclone is installed and configured."""
         try:
-            result = subprocess.run(['rclone', 'version'], capture_output=True, text=True)
+            result = subprocess.run(['rclone', 'version'], capture_output=True, text=True, timeout=TimeoutConstants.QUICK)
             if result.returncode == 0:
                 return True
         except FileNotFoundError:
@@ -4266,11 +5568,12 @@ print(f"\\n✓ All conversions complete! Converted {{len(candidates)}} videos to
     def get_rclone_remotes(self):
         """Get list of configured rclone remotes."""
         try:
-            result = subprocess.run(['rclone', 'listremotes'], capture_output=True, text=True)
+            result = subprocess.run(['rclone', 'listremotes'], capture_output=True, text=True, timeout=TimeoutConstants.QUICK)
             if result.returncode == 0:
                 remotes = [line.strip().rstrip(':') for line in result.stdout.strip().split('\n') if line.strip()]
                 return remotes
-        except:
+        except (subprocess.SubprocessError, OSError) as e:
+            print(f"Warning: Could not list rclone remotes: {e}")
             pass
         return []
     
@@ -4287,8 +5590,9 @@ print(f"\\n✓ All conversions complete! Converted {{len(candidates)}} videos to
                 print("❌ rclone is not installed or not in PATH")
                 print("\nTo install rclone:")
                 print("  macOS: brew install rclone")
-                print("  Linux: curl https://rclone.org/install.sh | sudo bash")
-                print("  Manual: https://rclone.org/downloads/")
+                print("  Ubuntu/Debian: apt install rclone")
+                print("  RHEL/CentOS: yum install rclone") 
+                print("  Manual: Download from https://rclone.org/downloads/")
                 input("\nPress Enter to continue...")
                 return
             
@@ -4317,7 +5621,7 @@ print(f"\\n✓ All conversions complete! Converted {{len(candidates)}} videos to
             print("0. Back to main menu")
             print()
             
-            choice = input("Enter your choice: ").strip()
+            choice = self.safe_input("Enter your choice: ")
             
             if choice == '0':
                 break
@@ -4352,7 +5656,7 @@ print(f"\\n✓ All conversions complete! Converted {{len(candidates)}} videos to
             item_path = os.path.join(self.base_path, item)
             if os.path.isdir(item_path) and not item.startswith('.'):
                 size_gb = sum(os.path.getsize(os.path.join(dirpath, filename))
-                             for dirpath, dirnames, filenames in os.walk(item_path)
+                             for dirpath, dirnames, filenames in os.walk(item_path, followlinks=False)
                              for filename in filenames) / (1024**3)
                 main_dirs.append({'name': item, 'size_gb': size_gb})
         
@@ -4363,7 +5667,7 @@ print(f"\\n✓ All conversions complete! Converted {{len(candidates)}} videos to
         print(f"\n{len(main_dirs)+1}. All directories")
         print("0. Cancel")
         
-        dir_choice = input("\nSelect directory to sync: ").strip()
+        dir_choice = self.safe_input("\nSelect directory to sync: ")
         
         if dir_choice == '0':
             return
@@ -4386,7 +5690,7 @@ print(f"\\n✓ All conversions complete! Converted {{len(candidates)}} videos to
         for i, remote in enumerate(remotes, 1):
             print(f"{i}. {remote}")
         
-        remote_choice = input("Select remote: ").strip()
+        remote_choice = self.safe_input("Select remote: ")
         try:
             selected_remote = remotes[int(remote_choice) - 1]
         except (ValueError, IndexError):
@@ -4400,7 +5704,7 @@ print(f"\\n✓ All conversions complete! Converted {{len(candidates)}} videos to
         print("2. Sync (mirror - will delete files not in source)")
         print("3. Move (upload then delete local files)")
         
-        sync_choice = input("Select sync type: ").strip()
+        sync_choice = self.safe_input("Select sync type: ")
         
         sync_commands = {
             '1': 'copy',
@@ -4427,7 +5731,7 @@ print(f"\\n✓ All conversions complete! Converted {{len(candidates)}} videos to
         elif sync_choice == '2':
             print(f"\n⚠️  WARNING: SYNC will delete remote files not in source!")
         
-        confirm = input(f"\nProceed with {sync_cmd}? (y/N): ")
+        confirm = self.safe_input(f"\nProceed with {sync_cmd}? (y/N): ")
         if confirm.lower() != 'y':
             return
         
@@ -4449,13 +5753,23 @@ print(f"\\n✓ All conversions complete! Converted {{len(candidates)}} videos to
             
             print(f"Command: {' '.join(cmd)}")
             try:
-                subprocess.run(cmd)
-                print(f"✅ {dir_name} {sync_cmd} completed!")
+                self.security_audit_log("CLOUD_SYNC_STARTED", f"Command: {sync_cmd}, Remote: {selected_remote}, Dir: {dir_name}")
+                result = subprocess.run(cmd, capture_output=True, text=True, timeout=TimeoutConstants.LONG)
+                # Display output safely
+                if result.stdout:
+                    print(result.stdout)
+                if result.stderr:
+                    print(result.stderr, file=sys.stderr)
+                if result.returncode == 0:
+                    self.security_audit_log("CLOUD_SYNC_COMPLETED", f"Command: {sync_cmd}, Remote: {selected_remote}, Dir: {dir_name}")
+                    print(f"✅ {dir_name} {sync_cmd} completed!")
+                else:
+                    print(f"⚠️  {dir_name} {sync_cmd} completed with warnings")
             except KeyboardInterrupt:
                 print(f"\n⚠️  {sync_cmd} interrupted for {dir_name}")
                 break
-            except Exception as e:
-                print(f"❌ Error during {sync_cmd}: {e}")
+            except (subprocess.SubprocessError, OSError, IOError) as e:
+                print(f"❌ Error during {sync_cmd}: {self.sanitize_error_message(str(e))}")
         
         input("\nPress Enter to continue...")
     
@@ -4468,11 +5782,11 @@ print(f"\\n✓ All conversions complete! Converted {{len(candidates)}} videos to
         
         # Calculate total size
         total_size = 0
-        for root, dirs, files in os.walk(self.base_path):
+        for root, dirs, files in os.walk(self.base_path, followlinks=False):
             for file in files:
                 try:
                     total_size += os.path.getsize(os.path.join(root, file))
-                except:
+                except (OSError, IOError) as e:
                     continue
         
         total_size_gb = total_size / (1024**3)
@@ -4486,7 +5800,7 @@ print(f"\\n✓ All conversions complete! Converted {{len(candidates)}} videos to
         for i, remote in enumerate(remotes, 1):
             print(f"{i}. {remote}")
         
-        remote_choice = input("Select backup destination: ").strip()
+        remote_choice = self.safe_input("Select backup destination: ")
         try:
             selected_remote = remotes[int(remote_choice) - 1]
         except (ValueError, IndexError):
@@ -4500,7 +5814,7 @@ print(f"\\n✓ All conversions complete! Converted {{len(candidates)}} videos to
         print("2. Full sync (mirror - remote matches local exactly)")
         print("3. Archive mode (copy with checksums, no deletions)")
         
-        backup_choice = input("Select backup type: ").strip()
+        backup_choice = self.safe_input("Select backup type: ")
         
         backup_commands = {
             '1': ['copy', '--update', '--checksum'],
@@ -4529,7 +5843,7 @@ print(f"\\n✓ All conversions complete! Converted {{len(candidates)}} videos to
         estimated_hours = total_size_gb / 100  # Assume 100 GB/hour
         print(f"   Estimated time: {estimated_hours:.1f} hours")
         
-        confirm = input(f"\nStart backup? (y/N): ")
+        confirm = self.safe_input(f"\nStart backup? (y/N): ")
         if confirm.lower() != 'y':
             return
         
@@ -4551,12 +5865,15 @@ print(f"\\n✓ All conversions complete! Converted {{len(candidates)}} videos to
         print(f"💡 Press Ctrl+C to safely stop the backup\n")
         
         try:
-            subprocess.run(cmd)
-            print(f"\n✅ Backup completed successfully!")
+            result = subprocess.run(cmd, text=True)
+            if result.returncode == 0:
+                print(f"\n✅ Backup completed successfully!")
+            else:
+                print(f"\n⚠️  Backup completed with warnings")
         except KeyboardInterrupt:
             print(f"\n⚠️  Backup interrupted by user")
-        except Exception as e:
-            print(f"\n❌ Backup failed: {e}")
+        except (subprocess.SubprocessError, OSError, IOError) as e:
+            print(f"\n❌ Backup failed: {self.sanitize_error_message(str(e))}")
         
         input("\nPress Enter to continue...")
     
@@ -4572,7 +5889,7 @@ print(f"\\n✓ All conversions complete! Converted {{len(candidates)}} videos to
         for i, remote in enumerate(remotes, 1):
             print(f"{i}. {remote}")
         
-        remote_choice = input("Select source remote: ").strip()
+        remote_choice = self.safe_input("Select source remote: ")
         try:
             selected_remote = remotes[int(remote_choice) - 1]
         except (ValueError, IndexError):
@@ -4599,7 +5916,7 @@ print(f"\\n✓ All conversions complete! Converted {{len(candidates)}} videos to
                 for i, dir_name in enumerate(dirs, 1):
                     print(f"{i}. {dir_name}")
                 
-                dir_choice = input("Select directory to download (or 'all'): ").strip()
+                dir_choice = self.safe_input("Select directory to download (or 'all'): ")
                 
                 if dir_choice.lower() == 'all':
                     selected_dirs = dirs
@@ -4617,7 +5934,7 @@ print(f"\\n✓ All conversions complete! Converted {{len(candidates)}} videos to
                 print(f"   Directories: {', '.join(selected_dirs)}")
                 print(f"   Destination: {self.base_path}")
                 
-                confirm = input(f"\nStart download? (y/N): ")
+                confirm = self.safe_input(f"\nStart download? (y/N): ")
                 if confirm.lower() != 'y':
                     return
                 
@@ -4638,18 +5955,26 @@ print(f"\\n✓ All conversions complete! Converted {{len(candidates)}} videos to
                     ]
                     
                     try:
-                        subprocess.run(cmd)
-                        print(f"✅ {dir_name} downloaded!")
+                        result = subprocess.run(cmd, capture_output=True, text=True, timeout=TimeoutConstants.LONG)
+                # Display output safely
+                if result.stdout:
+                    print(result.stdout)
+                if result.stderr:
+                    print(result.stderr, file=sys.stderr)
+                        if result.returncode == 0:
+                            print(f"✅ {dir_name} downloaded!")
+                        else:
+                            print(f"⚠️  {dir_name} download completed with warnings")
                     except KeyboardInterrupt:
                         print(f"\n⚠️  Download interrupted")
                         break
-                    except Exception as e:
-                        print(f"❌ Download failed: {e}")
+                    except (subprocess.SubprocessError, OSError, IOError) as e:
+                        print(f"❌ Download failed: {self.sanitize_error_message(str(e))}")
                 
             else:
                 print(f"❌ Could not access {selected_remote}")
-        except Exception as e:
-            print(f"❌ Error accessing remote: {e}")
+        except (ValueError, IndexError, subprocess.SubprocessError, OSError) as e:
+            print(f"❌ Error accessing remote: {self.sanitize_error_message(str(e))}")
         
         input("\nPress Enter to continue...")
     
@@ -4665,7 +5990,7 @@ print(f"\\n✓ All conversions complete! Converted {{len(candidates)}} videos to
         for i, remote in enumerate(remotes, 1):
             print(f"{i}. {remote}")
         
-        remote_choice = input("Select remote to check: ").strip()
+        remote_choice = self.safe_input("Select remote to check: ")
         try:
             selected_remote = remotes[int(remote_choice) - 1]
         except (ValueError, IndexError):
@@ -4689,19 +6014,23 @@ print(f"\\n✓ All conversions complete! Converted {{len(candidates)}} videos to
         print(f"Running: {' '.join(cmd)}")
         
         try:
-            result = subprocess.run(cmd, capture_output=True, text=True)
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=TimeoutConstants.STANDARD)
             
             if result.returncode == 0:
                 print("✅ Local and remote are in sync!")
             else:
                 print("📊 Sync differences found:")
                 if result.stdout:
-                    print(result.stdout)
+                    # Sanitize output to prevent information disclosure
+                    sanitized_out = self.sanitize_error_message(result.stdout)
+                    print(sanitized_out)
                 if result.stderr:
-                    print(result.stderr)
+                    # Sanitize error output
+                    sanitized_err = self.sanitize_error_message(result.stderr)
+                    print(sanitized_err)
                     
-        except Exception as e:
-            print(f"❌ Error checking sync status: {e}")
+        except (subprocess.SubprocessError, OSError, IOError) as e:
+            print(f"❌ Error checking sync status: {self.sanitize_error_message(str(e))}")
         
         input("\nPress Enter to continue...")
     
@@ -4714,10 +6043,10 @@ print(f"\\n✓ All conversions complete! Converted {{len(candidates)}} videos to
         
         print("Current rclone configuration file location:")
         try:
-            result = subprocess.run(['rclone', 'config', 'file'], capture_output=True, text=True)
+            result = subprocess.run(['rclone', 'config', 'file'], capture_output=True, text=True, timeout=TimeoutConstants.QUICK)
             if result.returncode == 0:
                 print(f"📁 {result.stdout.strip()}")
-        except:
+        except (subprocess.SubprocessError, OSError) as e:
             print("❌ Could not locate config file")
         
         print("\nBandwidth limit options:")
@@ -4727,7 +6056,7 @@ print(f"\\n✓ All conversions complete! Converted {{len(candidates)}} videos to
         print("4. 100 Mbps (high speed)")
         print("5. Custom limit")
         
-        choice = input("Select bandwidth limit: ").strip()
+        choice = self.safe_input("Select bandwidth limit: ")
         
         limits = {
             '1': None,
@@ -4745,7 +6074,7 @@ print(f"\\n✓ All conversions complete! Converted {{len(candidates)}} videos to
                 print(f"✅ Bandwidth limit set to {limit}")
                 print(f"💡 Add --bwlimit {limit} to rclone commands")
         elif choice == '5':
-            custom_limit = input("Enter custom limit (e.g., '25M', '1G'): ").strip()
+            custom_limit = self.safe_input("Enter custom limit (e.g., '25M', '1G'): ")
             print(f"✅ Custom bandwidth limit: {custom_limit}")
             print(f"💡 Add --bwlimit {custom_limit} to rclone commands")
         
@@ -4763,7 +6092,7 @@ print(f"\\n✓ All conversions complete! Converted {{len(candidates)}} videos to
         for i, remote in enumerate(remotes, 1):
             print(f"{i}. {remote}")
         
-        remote_choice = input("Select remote to verify: ").strip()
+        remote_choice = self.safe_input("Select remote to verify: ")
         try:
             selected_remote = remotes[int(remote_choice) - 1]
         except (ValueError, IndexError):
@@ -4776,7 +6105,7 @@ print(f"\\n✓ All conversions complete! Converted {{len(candidates)}} videos to
         print(f"\n🔍 Verifying integrity between local and {remote_path}...")
         print("This will compare checksums of all files (may take a while)")
         
-        confirm = input("Start verification? (y/N): ")
+        confirm = self.safe_input("Start verification? (y/N): ")
         if confirm.lower() != 'y':
             return
         
@@ -4789,15 +6118,15 @@ print(f"\\n✓ All conversions complete! Converted {{len(candidates)}} videos to
         print(f"\n🚀 Starting integrity check...")
         
         try:
-            result = subprocess.run(cmd)
+            result = subprocess.run(cmd, text=True)
             if result.returncode == 0:
                 print("✅ All files verified successfully!")
             else:
                 print("⚠️  Some files have differences - check the log file")
         except KeyboardInterrupt:
             print("\n⚠️  Verification interrupted")
-        except Exception as e:
-            print(f"❌ Verification failed: {e}")
+        except (subprocess.SubprocessError, OSError, IOError) as e:
+            print(f"❌ Verification failed: {self.sanitize_error_message(str(e))}")
         
         input("\nPress Enter to continue...")
     
@@ -4810,22 +6139,41 @@ print(f"\\n✓ All conversions complete! Converted {{len(candidates)}} videos to
         
         try:
             # Show config file location
-            result = subprocess.run(['rclone', 'config', 'file'], capture_output=True, text=True)
+            result = subprocess.run(['rclone', 'config', 'file'], capture_output=True, text=True, timeout=TimeoutConstants.QUICK)
             if result.returncode == 0:
                 print(f"📁 Config file: {result.stdout.strip()}")
-        except:
+        except (subprocess.SubprocessError, OSError) as e:
             pass
         
         # Show remotes with details
         try:
-            result = subprocess.run(['rclone', 'config', 'show'], capture_output=True, text=True)
+            result = subprocess.run(['rclone', 'config', 'show'], capture_output=True, text=True, timeout=TimeoutConstants.QUICK)
             if result.returncode == 0:
                 print(f"\n📡 Configured remotes:")
-                print(result.stdout)
+                # Filter out sensitive information from config output
+                lines = result.stdout.split('\n')
+                filtered_lines = []
+                current_remote = None
+                for line in lines:
+                    # Track current remote section
+                    if line.startswith('[') and line.endswith(']'):
+                        current_remote = line
+                        filtered_lines.append(line)
+                    # Hide lines containing sensitive data
+                    elif any(keyword in line.lower() for keyword in ['token', 'password', 'key', 'secret', 'auth', 'bearer', 'credential', 'private']):
+                        # Only show that a credential exists, not its value
+                        key_part = line.split('=')[0].strip() if '=' in line else 'credential'
+                        filtered_lines.append(f"    {key_part} = [REDACTED]")
+                    # Show only safe configuration options
+                    elif '=' in line and any(safe in line.lower() for safe in ['type', 'region', 'endpoint', 'provider', 'env_auth']):
+                        filtered_lines.append(line)
+                    elif line.strip() == '':
+                        filtered_lines.append(line)
+                print('\n'.join(filtered_lines))
             else:
                 print("❌ Could not show configuration")
-        except Exception as e:
-            print(f"❌ Error reading config: {e}")
+        except (subprocess.SubprocessError, OSError, IOError) as e:
+            print(f"❌ Error reading config: {self.sanitize_error_message(str(e))}")
         
         print("\n💡 Useful rclone commands:")
         print("   rclone config          - Configure new remote")
@@ -4836,5 +6184,15 @@ print(f"\\n✓ All conversions complete! Converted {{len(candidates)}} videos to
         input("\nPress Enter to continue...")
 
 if __name__ == "__main__":
+    # Validate command line arguments for security
+    if len(sys.argv) > 1:
+        print("⚠️  This application does not accept command line arguments for security reasons.")
+        print("All configuration should be done through environment variables or the interactive menu.")
+        sys.exit(1)
+    
     manager = MediaManager()
-    manager.run()
+    manager.security_audit_log("APPLICATION_STARTED", f"Base path: {manager.base_path}")
+    try:
+        manager.run()
+    finally:
+        manager.security_audit_log("APPLICATION_STOPPED")
