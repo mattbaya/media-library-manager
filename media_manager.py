@@ -2064,7 +2064,10 @@ class MediaManager:
         
     def convert_to_resolution(self, target_resolution):
         """Convert videos to specified resolution (1080p or 720p)."""
-        print(f"\nPreparing to convert videos to {target_resolution}p...")
+        self.clear_screen()
+        print("="*60)
+        print(f"🎬 Convert Videos to {target_resolution}p")
+        print("="*60)
         
         # Check disk space before starting conversions
         has_space, space_msg = self.check_disk_space(FileSizeConstants.LARGE_FILE_THRESHOLD)  # Require 5GB minimum
@@ -2081,33 +2084,112 @@ class MediaManager:
             target_height = 720
             target_width = 1280
         
-        print(f"\nOptions:")
-        print(f"1. Convert all videos larger than {target_resolution}p")
-        print(f"2. Convert specific directory")
-        print(f"3. Convert single file")
-        print(f"0. Cancel")
+        # Check for cached conversion candidates
+        with self.get_db_context() as conn:
+            cursor = conn.cursor()
+            cursor.execute('''
+                SELECT COUNT(*) FROM video_files 
+                WHERE needs_conversion = 1 AND (width > ? OR height > ?)
+            ''', (target_width, target_height))
+            cached_candidates = cursor.fetchone()[0]
+            
+            cursor.execute('SELECT MAX(last_scanned) FROM video_files WHERE last_scanned IS NOT NULL')
+            last_scan = cursor.fetchone()[0]
         
-        choice = self.safe_input("\nEnter your choice: ")
-        
-        if choice == '0':
-            return
-        elif choice == '1':
-            # Run scan_and_convert with modifications for target resolution
-            self.run_conversion_scan(target_resolution, target_width, target_height)
-        elif choice == '2':
-            directory = self.safe_path_input("\nEnter directory path: ")
-            if os.path.exists(directory):
-                self.run_conversion_scan(target_resolution, target_width, target_height, directory)
+        if cached_candidates > 0 and last_scan:
+            scan_age = (time.time() - last_scan) / 3600  # hours
+            print(f"💡 Your recent scan found {cached_candidates:,} videos needing conversion to {target_resolution}p")
+            print(f"   (Scan was {scan_age:.1f} hours ago)")
+            print()
+            
+            if cached_candidates > 10:
+                print("📋 Batch Processing Options:")
+                print("1. Convert top 10 largest files (recommended)")
+                print(f"2. Convert all {cached_candidates:,} files")
+                print("3. Choose custom batch size")
+                print("4. Browse by directory instead")
+                print("0. Cancel")
+                
+                choice = self.safe_input("\nEnter your choice: ")
+                
+                if choice == '0':
+                    return
+                elif choice == '1':
+                    batch_size = 10
+                elif choice == '2':
+                    batch_size = cached_candidates
+                elif choice == '3':
+                    try:
+                        batch_size = int(self.safe_input("Enter batch size (1-50): "))
+                        batch_size = max(1, min(50, batch_size))
+                    except ValueError:
+                        print("Invalid batch size.")
+                        self.safe_input("Press Enter to continue...")
+                        return
+                elif choice == '4':
+                    self.convert_by_directory(target_resolution, target_width, target_height)
+                    return
+                else:
+                    print("Invalid choice.")
+                    self.safe_input("Press Enter to continue...")
+                    return
             else:
-                print("Directory not found!")
-                self.safe_input("\nPress Enter to continue...")
-        elif choice == '3':
-            file_path = self.safe_path_input("\nEnter video file path: ")
-            if os.path.exists(file_path):
-                self.convert_single_file(file_path, target_resolution, target_width, target_height)
+                print(f"📋 Found {cached_candidates} files needing conversion from recent scan")
+                batch_size = cached_candidates
+            
+            # Ask about processing mode
+            print(f"\n🎬 Processing Mode for {batch_size} files:")
+            print("1. Watch progress (interactive)")
+            print("2. Run in background (faster)")
+            
+            mode_choice = self.safe_input("\nChoose processing mode: ")
+            background_mode = (mode_choice == '2')
+            
+            # Get files from database, ordered by size (largest first)
+            with self.get_db_context() as conn:
+                cursor = conn.cursor()
+                cursor.execute('''
+                    SELECT file_path FROM video_files 
+                    WHERE needs_conversion = 1 AND (width > ? OR height > ?)
+                    ORDER BY file_size DESC
+                    LIMIT ?
+                ''', (target_width, target_height, batch_size))
+                
+                files_to_convert = [row[0] for row in cursor.fetchall()]
+            
+            if files_to_convert:
+                self.batch_convert_from_list(files_to_convert, target_resolution, target_width, target_height, background_mode)
             else:
-                print("File not found!")
-                self.safe_input("\nPress Enter to continue...")
+                print("No files found to convert.")
+                self.safe_input("Press Enter to continue...")
+        else:
+            # No cached data, show original menu
+            print("No recent scan data found. Choose an option:")
+            print(f"1. Convert all videos larger than {target_resolution}p")
+            print(f"2. Convert specific directory")
+            print(f"3. Convert single file")
+            print(f"0. Cancel")
+            
+            choice = self.safe_input("\nEnter your choice: ")
+            
+            if choice == '0':
+                return
+            elif choice == '1':
+                self.run_conversion_scan(target_resolution, target_width, target_height)
+            elif choice == '2':
+                directory = self.safe_path_input("\nEnter directory path: ")
+                if os.path.exists(directory):
+                    self.run_conversion_scan(target_resolution, target_width, target_height, directory)
+                else:
+                    print("Directory not found!")
+                    self.safe_input("\nPress Enter to continue...")
+            elif choice == '3':
+                file_path = self.safe_path_input("\nEnter video file path: ")
+                if os.path.exists(file_path):
+                    self.convert_single_file(file_path, target_resolution, target_width, target_height)
+                else:
+                    print("File not found!")
+                    self.safe_input("\nPress Enter to continue...")
                 
     def run_conversion_scan(self, target_resolution, target_width, target_height, directory=None):
         """Run conversion scan for videos larger than target resolution."""
@@ -2242,20 +2324,186 @@ class MediaManager:
         print(f"Original saved as: {os.path.basename(converted_filename)}")
         
         self.safe_input("\nPress Enter to continue...")
+    
+    def batch_convert_from_list(self, file_list, target_resolution, target_width, target_height, background_mode=False):
+        """Convert videos from a specific list with progress tracking."""
+        total_files = len(file_list)
+        successful = 0
+        failed = 0
         
-    def download_subtitles(self):
-        """Download English subtitles for videos."""
-        print("\nSubtitle Download Options:")
-        print("1. Download for all videos without subtitles")
-        print("2. Download for specific directory")
-        print("3. Download for single video")
+        print(f"\n🎬 Converting {total_files} files to {target_resolution}p...")
+        
+        if background_mode:
+            print("Running in background mode...")
+        
+        for i, file_path in enumerate(file_list, 1):
+            if not background_mode:
+                print(f"\n[{i}/{total_files}] Converting:")
+                print(f"   {os.path.basename(file_path)}")
+            
+            try:
+                self.convert_single_file(file_path, target_resolution, target_width, target_height)
+                successful += 1
+                
+                # Update database to mark as converted
+                with self.get_db_context() as conn:
+                    cursor = conn.cursor()
+                    cursor.execute('UPDATE video_files SET needs_conversion = 0 WHERE file_path = ?', (file_path,))
+                    
+            except Exception as e:
+                failed += 1
+                if not background_mode:
+                    print(f"   ✗ Failed: {self.sanitize_error_message(str(e))}")
+            
+            if background_mode and i % 5 == 0:
+                print(f"Progress: {i}/{total_files} ({successful} successful, {failed} failed)")
+        
+        print(f"\n✓ Batch conversion complete!")
+        print(f"   Successful: {successful}")
+        print(f"   Failed: {failed}")
+        
+        self.safe_input("\nPress Enter to continue...")
+    
+    def convert_by_directory(self, target_resolution, target_width, target_height):
+        """Convert videos organized by directory (Movies, TV, specific show)."""
+        print("\nChoose content type:")
+        print("1. Movies only")
+        print("2. TV Shows only") 
+        print("3. Pick specific TV show")
+        print("4. All content")
         print("0. Cancel")
         
         choice = self.safe_input("\nEnter your choice: ")
         
         if choice == '0':
             return
+        elif choice == '1':
+            self.process_conversions_by_category('Movies', target_resolution, target_width, target_height)
+        elif choice == '2':
+            self.process_conversions_by_category('TV', target_resolution, target_width, target_height)
+        elif choice == '3':
+            self.pick_tv_show_for_conversion(target_resolution, target_width, target_height)
+        elif choice == '4':
+            self.process_conversions_by_category('All', target_resolution, target_width, target_height)
+    
+    def process_conversions_by_category(self, category, target_resolution, target_width, target_height):
+        """Process conversions for a specific category."""
+        with self.get_db_context() as conn:
+            cursor = conn.cursor()
             
+            if category == 'Movies':
+                cursor.execute('''
+                    SELECT file_path FROM video_files 
+                    WHERE needs_conversion = 1 AND (width > ? OR height > ?)
+                    AND file_path LIKE '%/Movies/%'
+                    ORDER BY file_size DESC
+                ''', (target_width, target_height))
+            elif category == 'TV':
+                cursor.execute('''
+                    SELECT file_path FROM video_files 
+                    WHERE needs_conversion = 1 AND (width > ? OR height > ?)
+                    AND file_path LIKE '%/TV/%'
+                    ORDER BY file_size DESC
+                ''', (target_width, target_height))
+            else:  # All
+                cursor.execute('''
+                    SELECT file_path FROM video_files 
+                    WHERE needs_conversion = 1 AND (width > ? OR height > ?)
+                    ORDER BY file_size DESC
+                ''', (target_width, target_height))
+            
+            files = [row[0] for row in cursor.fetchall()]
+        
+        if not files:
+            print(f"No files needing conversion found in {category}")
+            self.safe_input("Press Enter to continue...")
+            return
+        
+        print(f"Found {len(files)} {category.lower()} files needing conversion to {target_resolution}p")
+        batch_size = min(10, len(files))  # Default to 10 max for conversions
+        
+        print(f"\n🎬 Processing Mode for {batch_size} files:")
+        print("1. Watch progress (interactive)")
+        print("2. Run in background (faster)")
+        
+        mode_choice = self.safe_input("\nChoose processing mode: ")
+        background_mode = (mode_choice == '2')
+        
+        self.batch_convert_from_list(files[:batch_size], target_resolution, target_width, target_height, background_mode)
+    
+    def pick_tv_show_for_conversion(self, target_resolution, target_width, target_height):
+        """Let user pick a specific TV show for conversion."""
+        with self.get_db_context() as conn:
+            cursor = conn.cursor()
+            cursor.execute('''
+                SELECT DISTINCT 
+                    SUBSTR(file_path, 1, INSTR(file_path, '/Season') - 1) as show_path,
+                    COUNT(*) as conversion_count
+                FROM video_files 
+                WHERE needs_conversion = 1 AND (width > ? OR height > ?)
+                AND file_path LIKE '%/TV/%'
+                AND file_path LIKE '%/Season%'
+                GROUP BY show_path
+                ORDER BY conversion_count DESC
+            ''', (target_width, target_height))
+            
+            shows = cursor.fetchall()
+        
+        if not shows:
+            print("No TV shows found needing conversion")
+            self.safe_input("Press Enter to continue...")
+            return
+        
+        print(f"\nTV Shows needing conversion to {target_resolution}p:")
+        for i, (show_path, count) in enumerate(shows[:20], 1):
+            show_name = os.path.basename(show_path)
+            print(f"{i:2}. {show_name} ({count} files)")
+        
+        print("0. Cancel")
+        
+        try:
+            choice = int(self.safe_input(f"\nSelect show (1-{min(20, len(shows))}): "))
+            if choice == 0:
+                return
+            elif 1 <= choice <= len(shows):
+                selected_show = shows[choice - 1][0]
+                
+                # Get files for this show
+                with self.get_db_context() as conn:
+                    cursor = conn.cursor()
+                    cursor.execute('''
+                        SELECT file_path FROM video_files 
+                        WHERE needs_conversion = 1 AND (width > ? OR height > ?)
+                        AND file_path LIKE ?
+                        ORDER BY file_size DESC
+                    ''', (target_width, target_height, f"{selected_show}%"))
+                    
+                    files = [row[0] for row in cursor.fetchall()]
+                
+                show_name = os.path.basename(selected_show)
+                print(f"\n🎬 Converting {len(files)} files for {show_name} to {target_resolution}p")
+                print("1. Watch progress (interactive)")
+                print("2. Run in background (faster)")
+                
+                mode_choice = self.safe_input("\nChoose processing mode: ")
+                background_mode = (mode_choice == '2')
+                
+                batch_size = min(10, len(files))  # Limit conversions to 10 per batch
+                self.batch_convert_from_list(files[:batch_size], target_resolution, target_width, target_height, background_mode)
+            else:
+                print("Invalid selection.")
+                self.safe_input("Press Enter to continue...")
+        except ValueError:
+            print("Invalid selection.")
+            self.safe_input("Press Enter to continue...")
+        
+    def download_subtitles(self):
+        """Download English subtitles for videos."""
+        self.clear_screen()
+        print("="*60)
+        print("📝 Download English Subtitles")
+        print("="*60)
+        
         # Check if subliminal is available
         if not self.optional_deps.get('subliminal', False):
             print("\nSubliminal is not installed. Please install it manually:")
@@ -2263,22 +2511,108 @@ class MediaManager:
             self.safe_input("\nPress Enter to continue...")
             return
         
-        if choice == '1':
-            self.download_subtitles_batch(self.base_path)
-        elif choice == '2':
-            directory = self.safe_path_input("\nEnter directory path: ")
-            if os.path.exists(directory):
-                self.download_subtitles_batch(directory)
+        # Check for cached subtitle data
+        with self.get_db_context() as conn:
+            cursor = conn.cursor()
+            cursor.execute('SELECT COUNT(*) FROM video_files WHERE has_external_subs = 0 AND has_embedded_subs = 0')
+            cached_count = cursor.fetchone()[0]
+            
+            cursor.execute('SELECT MAX(last_scanned) FROM video_files WHERE last_scanned IS NOT NULL')
+            last_scan = cursor.fetchone()[0]
+        
+        if cached_count > 0 and last_scan:
+            scan_age = (time.time() - last_scan) / 3600  # hours
+            print(f"💡 Your recent scan found {cached_count:,} files missing English subtitles")
+            print(f"   (Scan was {scan_age:.1f} hours ago)")
+            print()
+            
+            if cached_count > 100:
+                print("📋 Batch Processing Options:")
+                print("1. Process first 100 files (recommended)")
+                print(f"2. Process all {cached_count:,} files")
+                print("3. Choose custom batch size")
+                print("4. Browse by directory instead")
+                print("0. Cancel")
+                
+                choice = self.safe_input("\nEnter your choice: ")
+                
+                if choice == '0':
+                    return
+                elif choice == '1':
+                    batch_size = 100
+                elif choice == '2':
+                    batch_size = cached_count
+                elif choice == '3':
+                    try:
+                        batch_size = int(self.safe_input("Enter batch size (1-1000): "))
+                        batch_size = max(1, min(1000, batch_size))
+                    except ValueError:
+                        print("Invalid batch size.")
+                        self.safe_input("Press Enter to continue...")
+                        return
+                elif choice == '4':
+                    self.subtitle_menu_by_directory()
+                    return
+                else:
+                    print("Invalid choice.")
+                    self.safe_input("Press Enter to continue...")
+                    return
             else:
-                print("Directory not found!")
-                self.safe_input("\nPress Enter to continue...")
-        elif choice == '3':
-            file_path = self.safe_path_input("\nEnter video file path: ")
-            if os.path.exists(file_path):
-                self.download_subtitle_for_file(file_path)
+                print(f"📋 Found {cached_count} files needing subtitles from recent scan")
+                batch_size = cached_count
+            
+            # Ask about processing mode
+            print(f"\n🎬 Processing Mode for {batch_size} files:")
+            print("1. Watch progress (interactive)")
+            print("2. Run in background (faster)")
+            
+            mode_choice = self.safe_input("\nChoose processing mode: ")
+            background_mode = (mode_choice == '2')
+            
+            # Get files from database
+            with self.get_db_context() as conn:
+                cursor = conn.cursor()
+                cursor.execute('''
+                    SELECT file_path FROM video_files 
+                    WHERE has_external_subs = 0 AND has_embedded_subs = 0 
+                    LIMIT ?
+                ''', (batch_size,))
+                
+                files_to_process = [row[0] for row in cursor.fetchall()]
+            
+            if files_to_process:
+                self.download_subtitles_from_list(files_to_process, background_mode)
             else:
-                print("File not found!")
-                self.safe_input("\nPress Enter to continue...")
+                print("No files found to process.")
+                self.safe_input("Press Enter to continue...")
+        else:
+            # No cached data, show original menu
+            print("No recent scan data found. Choose an option:")
+            print("1. Download for all videos without subtitles")
+            print("2. Download for specific directory")
+            print("3. Download for single video")
+            print("0. Cancel")
+            
+            choice = self.safe_input("\nEnter your choice: ")
+            
+            if choice == '0':
+                return
+            elif choice == '1':
+                self.download_subtitles_batch(self.base_path)
+            elif choice == '2':
+                directory = self.safe_path_input("\nEnter directory path: ")
+                if os.path.exists(directory):
+                    self.download_subtitles_batch(directory)
+                else:
+                    print("Directory not found!")
+                    self.safe_input("\nPress Enter to continue...")
+            elif choice == '3':
+                file_path = self.safe_path_input("\nEnter video file path: ")
+                if os.path.exists(file_path):
+                    self.download_subtitle_for_file(file_path)
+                else:
+                    print("File not found!")
+                    self.safe_input("\nPress Enter to continue...")
                 
     def download_subtitles_batch(self, directory):
         """Download subtitles for all videos in directory that don't have them."""
@@ -2417,6 +2751,174 @@ class MediaManager:
             if not quiet:
                 print(f"✗ Error: {self.sanitize_error_message(str(e))}")
             return False
+    
+    def download_subtitles_from_list(self, file_list, background_mode=False):
+        """Download subtitles from a specific list of files with progress tracking."""
+        total_files = len(file_list)
+        successful = 0
+        failed = 0
+        
+        print(f"\n🎬 Processing {total_files} files for subtitle download...")
+        
+        if background_mode:
+            print("Running in background mode...")
+        
+        for i, file_path in enumerate(file_list, 1):
+            if not background_mode:
+                print(f"\n[{i}/{total_files}] Processing:")
+                
+            success = self.download_subtitle_for_file(file_path, quiet=background_mode)
+            
+            if success:
+                successful += 1
+                # Update database
+                with self.get_db_context() as conn:
+                    cursor = conn.cursor()
+                    cursor.execute('UPDATE video_files SET has_external_subs = 1 WHERE file_path = ?', (file_path,))
+            else:
+                failed += 1
+            
+            if background_mode and i % 10 == 0:
+                print(f"Progress: {i}/{total_files} ({successful} successful, {failed} failed)")
+        
+        print(f"\n✓ Subtitle download complete!")
+        print(f"   Successful: {successful}")
+        print(f"   Failed: {failed}")
+        
+        self.safe_input("\nPress Enter to continue...")
+    
+    def subtitle_menu_by_directory(self):
+        """Show subtitle menu organized by directory."""
+        print("\nChoose content type:")
+        print("1. Movies only")
+        print("2. TV Shows only")
+        print("3. Pick specific TV show")
+        print("4. All content")
+        print("0. Cancel")
+        
+        choice = self.safe_input("\nEnter your choice: ")
+        
+        if choice == '0':
+            return
+        elif choice == '1':
+            self.process_subtitles_by_category('Movies')
+        elif choice == '2':
+            self.process_subtitles_by_category('TV')
+        elif choice == '3':
+            self.pick_tv_show_for_subtitles()
+        elif choice == '4':
+            self.process_subtitles_by_category('All')
+    
+    def process_subtitles_by_category(self, category):
+        """Process subtitles for a specific category (Movies, TV, or All)."""
+        with self.get_db_context() as conn:
+            cursor = conn.cursor()
+            
+            if category == 'Movies':
+                cursor.execute('''
+                    SELECT file_path FROM video_files 
+                    WHERE has_external_subs = 0 AND has_embedded_subs = 0 
+                    AND file_path LIKE '%/Movies/%'
+                    ORDER BY file_size DESC
+                ''')
+            elif category == 'TV':
+                cursor.execute('''
+                    SELECT file_path FROM video_files 
+                    WHERE has_external_subs = 0 AND has_embedded_subs = 0 
+                    AND file_path LIKE '%/TV/%'
+                    ORDER BY file_size DESC
+                ''')
+            else:  # All
+                cursor.execute('''
+                    SELECT file_path FROM video_files 
+                    WHERE has_external_subs = 0 AND has_embedded_subs = 0 
+                    ORDER BY file_size DESC
+                ''')
+            
+            files = [row[0] for row in cursor.fetchall()]
+        
+        if not files:
+            print(f"No files needing subtitles found in {category}")
+            self.safe_input("Press Enter to continue...")
+            return
+        
+        print(f"Found {len(files)} {category.lower()} files needing subtitles")
+        batch_size = min(100, len(files))  # Default to 100 max
+        
+        # Ask about processing mode
+        print(f"\n🎬 Processing Mode for {batch_size} files:")
+        print("1. Watch progress (interactive)")
+        print("2. Run in background (faster)")
+        
+        mode_choice = self.safe_input("\nChoose processing mode: ")
+        background_mode = (mode_choice == '2')
+        
+        self.download_subtitles_from_list(files[:batch_size], background_mode)
+    
+    def pick_tv_show_for_subtitles(self):
+        """Let user pick a specific TV show for subtitle processing."""
+        with self.get_db_context() as conn:
+            cursor = conn.cursor()
+            cursor.execute('''
+                SELECT DISTINCT 
+                    SUBSTR(file_path, 1, INSTR(file_path, '/Season') - 1) as show_path,
+                    COUNT(*) as missing_count
+                FROM video_files 
+                WHERE has_external_subs = 0 AND has_embedded_subs = 0 
+                AND file_path LIKE '%/TV/%'
+                AND file_path LIKE '%/Season%'
+                GROUP BY show_path
+                ORDER BY missing_count DESC
+            ''')
+            
+            shows = cursor.fetchall()
+        
+        if not shows:
+            print("No TV shows found needing subtitles")
+            self.safe_input("Press Enter to continue...")
+            return
+        
+        print("\nTV Shows needing subtitles:")
+        for i, (show_path, count) in enumerate(shows[:20], 1):  # Show top 20
+            show_name = os.path.basename(show_path)
+            print(f"{i:2}. {show_name} ({count} files)")
+        
+        print("0. Cancel")
+        
+        try:
+            choice = int(self.safe_input(f"\nSelect show (1-{min(20, len(shows))}): "))
+            if choice == 0:
+                return
+            elif 1 <= choice <= len(shows):
+                selected_show = shows[choice - 1][0]
+                
+                # Get files for this show
+                with self.get_db_context() as conn:
+                    cursor = conn.cursor()
+                    cursor.execute('''
+                        SELECT file_path FROM video_files 
+                        WHERE has_external_subs = 0 AND has_embedded_subs = 0 
+                        AND file_path LIKE ?
+                        ORDER BY file_path
+                    ''', (f"{selected_show}%",))
+                    
+                    files = [row[0] for row in cursor.fetchall()]
+                
+                show_name = os.path.basename(selected_show)
+                print(f"\n🎬 Processing {len(files)} files for {show_name}")
+                print("1. Watch progress (interactive)")
+                print("2. Run in background (faster)")
+                
+                mode_choice = self.safe_input("\nChoose processing mode: ")
+                background_mode = (mode_choice == '2')
+                
+                self.download_subtitles_from_list(files, background_mode)
+            else:
+                print("Invalid selection.")
+                self.safe_input("Press Enter to continue...")
+        except ValueError:
+            print("Invalid selection.")
+            self.safe_input("Press Enter to continue...")
         
     def quick_fixes(self):
         """Quick fixes menu for common issues."""
@@ -5860,7 +6362,70 @@ class MediaManager:
                     for task_result in found['background_tasks'][-5:]:
                         print(f"   {task_result}")
         
-        self.safe_input("\nPress Enter to continue...")
+        # Action menu based on analysis results
+        print("\n" + "="*60)
+        print("🎯 What would you like to do?")
+        print("="*60)
+        
+        actions = []
+        action_num = 1
+        
+        if results['conversion_candidates']:
+            print(f"{action_num}. Convert top 10 largest videos to 1080p ({len(results['conversion_candidates'])} candidates)")
+            actions.append(('convert_top_10', results['conversion_candidates'][:10]))
+            action_num += 1
+        
+        if results['naming_issues']:
+            print(f"{action_num}. Fix naming issues ({len(results['naming_issues'])} files)")
+            actions.append(('fix_naming', results['naming_issues']))
+            action_num += 1
+        
+        if results['missing_subtitles']:
+            print(f"{action_num}. Download English subtitles ({len(results['missing_subtitles'])} files)")
+            actions.append(('download_subtitles', results['missing_subtitles']))
+            action_num += 1
+        
+        if results['codec_issues']:
+            print(f"{action_num}. Convert videos with old codecs ({len(results['codec_issues'])} files)")
+            actions.append(('convert_old_codecs', results['codec_issues']))
+            action_num += 1
+        
+        if results['system_files']:
+            print(f"{action_num}. Clean up system files ({len(results['system_files'])} files)")
+            actions.append(('cleanup_system', results['system_files']))
+            action_num += 1
+        
+        print(f"{action_num}. Go to main menu")
+        actions.append(('main_menu', None))
+        
+        print(f"0. Exit")
+        
+        choice = self.safe_input(f"\nEnter your choice (0-{action_num}): ")
+        
+        if choice == '0':
+            self.running = False
+            return
+        elif choice == str(action_num):
+            return  # Go to main menu
+        
+        try:
+            selected_action = actions[int(choice) - 1]
+            action_type, data = selected_action
+            
+            if action_type == 'convert_top_10':
+                self.batch_convert_videos(data, '1080p')
+            elif action_type == 'fix_naming':
+                self.smart_organization()
+            elif action_type == 'download_subtitles':
+                self.download_subtitles()
+            elif action_type == 'convert_old_codecs':
+                self.batch_convert_videos(data, '1080p')
+            elif action_type == 'cleanup_system':
+                self.cleanup_system_files()
+            
+        except (ValueError, IndexError):
+            print("Invalid choice.")
+            self.safe_input("Press Enter to continue...")
     
     def rebuild_analysis_from_db(self):
         """Rebuild analysis results from database."""
@@ -5920,11 +6485,8 @@ class MediaManager:
                     'resolution': f"{row['width']}x{row['height']}"
                 })
             
-        # Scan for system files (not cached)
-        for root, dirs, files in os.walk(self.base_path, followlinks=False):
-            for file in files:
-                if file in ['.DS_Store', 'Thumbs.db', 'desktop.ini'] or file.startswith('._'):
-                    results['system_files'].append(os.path.join(root, file))
+        # Skip system file scan for cached results to avoid performance hit
+        # System files are typically not critical for cached analysis viewing
         
         return results
     
