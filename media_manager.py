@@ -84,7 +84,32 @@ class MediaManager:
             raise ValueError(f"Base path is not readable: {self.base_path}")
         
         self.video_extensions = ('.mp4', '.mkv', '.avi', '.mov', '.flv', '.m4v', '.wmv')
-        self.db_path = os.path.join(self.base_path, 'media_library.db')
+        
+        # Store database in secure application directory (not in media directory)
+        if os.name == 'nt':  # Windows
+            app_data = os.path.expandvars('%APPDATA%')
+            db_dir = os.path.join(app_data, 'MediaLibraryManager')
+        else:  # Unix-like (macOS, Linux)
+            home = os.path.expanduser('~')
+            db_dir = os.path.join(home, '.media-library-manager')
+        
+        # Create secure directory with restrictive permissions
+        os.makedirs(db_dir, mode=0o700, exist_ok=True)
+        
+        self.db_path = os.path.join(db_dir, 'media_library.db')
+        
+        # Set restrictive permissions on database file if it exists
+        if os.path.exists(self.db_path):
+            os.chmod(self.db_path, 0o600)  # Read/write for owner only
+        
+        # Initialize loop safety mechanisms
+        self.max_menu_iterations = 1000  # Safety limit to prevent infinite loops
+        self.loop_start_time = None
+        self.running = True
+        
+        # Set up signal handlers for graceful shutdown
+        signal.signal(signal.SIGTERM, self.graceful_shutdown)
+        signal.signal(signal.SIGINT, self.graceful_shutdown)
         
         # Check dependencies at startup
         self.check_dependencies()
@@ -434,19 +459,41 @@ class MediaManager:
         return True
     
     def normalize_unicode_path(self, path):
-        """Normalize Unicode in file paths to handle different encodings."""
+        """Secure Unicode path normalization with attack detection."""
         if not isinstance(path, str):
             path = str(path)
         
-        # Normalize Unicode to NFC form (canonical decomposition + composition)
-        normalized = unicodedata.normalize('NFC', path)
+        # Apply different normalization forms to detect manipulation
+        nfc = unicodedata.normalize('NFC', path)
+        nfd = unicodedata.normalize('NFD', path)
+        nfkc = unicodedata.normalize('NFKC', path)
+        nfkd = unicodedata.normalize('NFKD', path)
+        
+        # If any normalization changes the path significantly, it's suspicious
+        if not all(norm == path for norm in [nfc, nfd, nfkc, nfkd]):
+            self.security_audit_log("UNICODE_ATTACK_DETECTED", f"Path normalization changed: {repr(path)}")
+            # Still allow with warning for legitimate Unicode file names
+            if len(path) != len(nfc) or any(ord(c) > 0x7F for c in path):
+                print(f"Warning: Unicode normalization changed path: {repr(path)} -> {repr(nfc)}")
         
         # Remove any zero-width or control characters that could cause issues
-        cleaned = ''.join(char for char in normalized 
+        cleaned = ''.join(char for char in nfc 
                          if not unicodedata.category(char).startswith('C') 
                          or char in ['\n', '\r', '\t'])
         
+        # Reject paths with dangerous Unicode patterns
+        dangerous_patterns = ['\u202E', '\u202D', '\uFEFF', '\u200B', '\u200C', '\u200D']
+        for pattern in dangerous_patterns:
+            if pattern in cleaned:
+                raise ValueError(f"Path contains dangerous Unicode character: {repr(pattern)}")
+        
         return cleaned
+    
+    def graceful_shutdown(self, signum, frame):
+        """Handle shutdown signals gracefully."""
+        print("\n🛑 Received shutdown signal. Exiting safely...")
+        self.running = False
+        sys.exit(0)
     
     def detect_file_encoding(self, file_path):
         """Detect file encoding with fallback options."""
@@ -1424,7 +1471,7 @@ class MediaManager:
         else:
             print("No videos found that need conversion.")
         
-        input("\nPress Enter to continue...")
+        self.safe_input("\nPress Enter to continue...")
         
     def top_shows_by_size(self):
         """Show top 10 TV shows by total size."""
@@ -1470,7 +1517,7 @@ class MediaManager:
         print(f"\nTotal TV Shows: {len(show_sizes)}")
         print(f"Total Size: {total_size / (1024**3):.2f} GB")
         
-        input("\nPress Enter to continue...")
+        self.safe_input("\nPress Enter to continue...")
         
     def top_video_files(self):
         """Show top 10 individual video files by size."""
@@ -1504,7 +1551,7 @@ class MediaManager:
             print(f"{i:2}. {video['name']} ({video['size_gb']:.2f} GB)")
             print(f"    {video['relative_path']}")
         
-        input("\nPress Enter to continue...")
+        self.safe_input("\nPress Enter to continue...")
         
     def delete_show(self):
         """Delete a TV show."""
@@ -1512,7 +1559,7 @@ class MediaManager:
         
         if not os.path.exists(tv_path):
             print("TV directory not found!")
-            input("\nPress Enter to continue...")
+            self.safe_input("\nPress Enter to continue...")
             return
         
         shows = [d for d in os.listdir(tv_path) if os.path.isdir(os.path.join(tv_path, d))]
@@ -1553,7 +1600,7 @@ class MediaManager:
         except (ValueError, KeyboardInterrupt):
             print("\nCancelled.")
         
-        input("\nPress Enter to continue...")
+        self.safe_input("\nPress Enter to continue...")
         
     def delete_video_file(self):
         """Delete a specific video file."""
@@ -1578,7 +1625,7 @@ class MediaManager:
         
         if not matching_files:
             print(f"No files found matching '{search}'")
-            input("\nPress Enter to continue...")
+            self.safe_input("\nPress Enter to continue...")
             return
         
         print(f"\nFound {len(matching_files)} matching files:")
@@ -1616,7 +1663,7 @@ class MediaManager:
         except (ValueError, KeyboardInterrupt):
             print("\nCancelled.")
         
-        input("\nPress Enter to continue...")
+        self.safe_input("\nPress Enter to continue...")
         
     def check_subtitles(self):
         """Check which videos don't have English subtitles."""
@@ -1688,7 +1735,7 @@ class MediaManager:
         print("  - OpenSubtitles.org API")
         print("  - subdl (pip install subdl)")
         
-        input("\nPress Enter to continue...")
+        self.safe_input("\nPress Enter to continue...")
         
     def convert_to_resolution(self, target_resolution):
         """Convert videos to specified resolution (1080p or 720p)."""
@@ -1728,14 +1775,14 @@ class MediaManager:
                 self.run_conversion_scan(target_resolution, target_width, target_height, directory)
             else:
                 print("Directory not found!")
-                input("\nPress Enter to continue...")
+                self.safe_input("\nPress Enter to continue...")
         elif choice == '3':
             file_path = self.safe_path_input("\nEnter video file path: ")
             if os.path.exists(file_path):
                 self.convert_single_file(file_path, target_resolution, target_width, target_height)
             else:
                 print("File not found!")
-                input("\nPress Enter to continue...")
+                self.safe_input("\nPress Enter to continue...")
                 
     def run_conversion_scan(self, target_resolution, target_width, target_height, directory=None):
         """Run conversion scan for videos larger than target resolution."""
@@ -1814,7 +1861,7 @@ class MediaManager:
         
         print(f"\n✓ All conversions complete! Converted {len(candidates)} videos to {target_resolution}p.")
         
-        input("\nPress Enter to continue...")
+        self.safe_input("\nPress Enter to continue...")
         
     def convert_single_file(self, file_path, target_resolution, target_width, target_height):
         """Convert a single video file."""
@@ -1869,7 +1916,7 @@ class MediaManager:
         print(f"✓ Conversion complete!")
         print(f"Original saved as: {os.path.basename(converted_filename)}")
         
-        input("\nPress Enter to continue...")
+        self.safe_input("\nPress Enter to continue...")
         
     def download_subtitles(self):
         """Download English subtitles for videos."""
@@ -1899,14 +1946,14 @@ class MediaManager:
                 self.download_subtitles_batch(directory)
             else:
                 print("Directory not found!")
-                input("\nPress Enter to continue...")
+                self.safe_input("\nPress Enter to continue...")
         elif choice == '3':
             file_path = self.safe_path_input("\nEnter video file path: ")
             if os.path.exists(file_path):
                 self.download_subtitle_for_file(file_path)
             else:
                 print("File not found!")
-                input("\nPress Enter to continue...")
+                self.safe_input("\nPress Enter to continue...")
                 
     def download_subtitles_batch(self, directory):
         """Download subtitles for all videos in directory that don't have them."""
@@ -1960,7 +2007,7 @@ class MediaManager:
         
         if not videos_needing_subs:
             print(f"✓ All {videos_checked} videos already have subtitles!")
-            input("\nPress Enter to continue...")
+            self.safe_input("\nPress Enter to continue...")
             return
         
         print(f"\nScan Results:")
@@ -2001,7 +2048,7 @@ class MediaManager:
                     f.write(f"{path}\n")
             print(f"  Failed list saved to: failed_subtitle_downloads.txt")
         
-        input("\nPress Enter to continue...")
+        self.safe_input("\nPress Enter to continue...")
         
     def download_subtitle_for_file(self, video_path, quiet=False):
         """Download subtitle for a single video file using subliminal."""
@@ -2100,7 +2147,7 @@ class MediaManager:
         
         if not files_to_remove:
             print("No sample/trailer files found!")
-            input("\nPress Enter to continue...")
+            self.safe_input("\nPress Enter to continue...")
             return
         
         print(f"\nFound {len(files_to_remove)} sample/trailer files:")
@@ -2122,7 +2169,7 @@ class MediaManager:
                     print(f"Error deleting {path}: {message}")
             print(f"✓ Deleted {len(files_to_remove)} files")
         
-        input("\nPress Enter to continue...")
+        self.safe_input("\nPress Enter to continue...")
         
     def clean_system_files(self):
         """Remove .DS_Store, thumbs.db, and other system files."""
@@ -2143,7 +2190,7 @@ class MediaManager:
                         print(f"Failed to remove {self.sanitize_path_for_display(file_path)}: {message}")
         
         print(f"\n✓ Removed {files_removed} system files")
-        input("\nPress Enter to continue...")
+        self.safe_input("\nPress Enter to continue...")
         
     def clean_empty_folders(self):
         """Remove empty folders."""
@@ -2157,7 +2204,7 @@ class MediaManager:
         
         if not empty_folders:
             print("No empty folders found!")
-            input("\nPress Enter to continue...")
+            self.safe_input("\nPress Enter to continue...")
             return
         
         print(f"\nFound {len(empty_folders)} empty folders:")
@@ -2176,7 +2223,7 @@ class MediaManager:
                     print(f"Error removing {folder}: {e}")
             print(f"✓ Removed {len(empty_folders)} empty folders")
         
-        input("\nPress Enter to continue...")
+        self.safe_input("\nPress Enter to continue...")
         
     def remove_converted_suffix(self):
         """Remove '-CONVERTED' suffix from filenames."""
@@ -2197,7 +2244,7 @@ class MediaManager:
         
         if not converted_files:
             print("No files with '-CONVERTED' suffix found!")
-            input("\nPress Enter to continue...")
+            self.safe_input("\nPress Enter to continue...")
             return
         
         print(f"\nFound {len(converted_files)} files with '-CONVERTED' suffix:")
@@ -2216,7 +2263,7 @@ class MediaManager:
                     print(f"Error renaming {self.sanitize_path_for_display(old_path)}: {self.sanitize_error_message(str(e))}")
             print(f"✓ Renamed {len(converted_files)} files")
         
-        input("\nPress Enter to continue...")
+        self.safe_input("\nPress Enter to continue...")
         
     def fix_naming_issues(self):
         """Fix common naming issues."""
@@ -2255,7 +2302,7 @@ class MediaManager:
         
         if not issues_found:
             print("No naming issues found!")
-            input("\nPress Enter to continue...")
+            self.safe_input("\nPress Enter to continue...")
             return
         
         print(f"\nFound {len(issues_found)} files with naming issues:")
@@ -2275,7 +2322,7 @@ class MediaManager:
                     print(f"Error renaming {self.sanitize_path_for_display(old_path)}: {self.sanitize_error_message(str(e))}")
             print(f"✓ Fixed {len(issues_found)} files")
         
-        input("\nPress Enter to continue...")
+        self.safe_input("\nPress Enter to continue...")
         
     def remove_duplicate_subtitles(self):
         """Remove duplicate subtitle files."""
@@ -2314,7 +2361,7 @@ class MediaManager:
         
         if not duplicates:
             print("No duplicate subtitle files found!")
-            input("\nPress Enter to continue...")
+            self.safe_input("\nPress Enter to continue...")
             return
         
         print(f"\nFound {len(duplicates)} duplicate subtitle files:")
@@ -2334,7 +2381,7 @@ class MediaManager:
                     print(f"Error removing {dup}: {message}")
             print(f"✓ Removed {len(duplicates)} duplicate subtitle files")
         
-        input("\nPress Enter to continue...")
+        self.safe_input("\nPress Enter to continue...")
         
     def find_duplicates(self):
         """Find duplicate video files."""
@@ -2396,7 +2443,7 @@ class MediaManager:
         
         if not duplicates:
             print(f"\nNo exact duplicates found among {total_videos} videos!")
-            input("\nPress Enter to continue...")
+            self.safe_input("\nPress Enter to continue...")
             return
         
         # Sort by size
@@ -2438,7 +2485,7 @@ class MediaManager:
                 f.write("\n")
         
         print(f"\nFull report saved to: duplicate_files_report.txt")
-        input("\nPress Enter to continue...")
+        self.safe_input("\nPress Enter to continue...")
         
     def find_similar_titles(self):
         """Find videos with similar titles."""
@@ -2495,7 +2542,7 @@ class MediaManager:
         
         if not similar_groups:
             print("\nNo similar titles found!")
-            input("\nPress Enter to continue...")
+            self.safe_input("\nPress Enter to continue...")
             return
         
         print(f"\nFound {len(similar_groups)} groups of similar titles:")
@@ -2510,7 +2557,7 @@ class MediaManager:
         if len(similar_groups) > 10:
             print(f"\n... and {len(similar_groups) - 10} more groups")
         
-        input("\nPress Enter to continue...")
+        self.safe_input("\nPress Enter to continue...")
         
     def find_duplicate_episodes(self):
         """Find duplicate TV episodes."""
@@ -2519,7 +2566,7 @@ class MediaManager:
         tv_path = os.path.join(self.base_path, "TV")
         if not os.path.exists(tv_path):
             print("TV directory not found!")
-            input("\nPress Enter to continue...")
+            self.safe_input("\nPress Enter to continue...")
             return
         
         import re
@@ -2566,7 +2613,7 @@ class MediaManager:
         
         if not duplicates:
             print("\nNo duplicate episodes found!")
-            input("\nPress Enter to continue...")
+            self.safe_input("\nPress Enter to continue...")
             return
         
         print(f"\nFound {len(duplicates)} duplicate episodes:")
@@ -2581,7 +2628,7 @@ class MediaManager:
         if len(duplicates) > 20:
             print(f"\n... and {len(duplicates) - 20} more")
         
-        input("\nPress Enter to continue...")
+        self.safe_input("\nPress Enter to continue...")
         
     def library_health_check(self):
         """Perform a health check on the video library."""
@@ -2663,7 +2710,7 @@ class MediaManager:
             
             print(f"\nFull report saved to: corrupted_files_report.txt")
         
-        input("\nPress Enter to continue...")
+        self.safe_input("\nPress Enter to continue...")
         
     def check_unusual_codecs(self):
         """Check for videos with unusual codecs that Plex might struggle with."""
@@ -2723,7 +2770,7 @@ class MediaManager:
                 if len(videos) > 5:
                     print(f"  ... and {len(videos) - 5} more")
         
-        input("\nPress Enter to continue...")
+        self.safe_input("\nPress Enter to continue...")
         
     def check_missing_episodes(self):
         """Check for missing episodes in TV series."""
@@ -2732,7 +2779,7 @@ class MediaManager:
         tv_path = os.path.join(self.base_path, "TV")
         if not os.path.exists(tv_path):
             print("TV directory not found!")
-            input("\nPress Enter to continue...")
+            self.safe_input("\nPress Enter to continue...")
             return
         
         import re
@@ -2777,7 +2824,7 @@ class MediaManager:
                     print(f"\n{show_dir}:")
                     print(f"  Missing episodes: {', '.join(missing)}")
         
-        input("\nPress Enter to continue...")
+        self.safe_input("\nPress Enter to continue...")
         
     def verify_file_integrity(self):
         """Verify file integrity using file size and basic checks."""
@@ -2806,7 +2853,7 @@ class MediaManager:
             for path, issue in suspicious_files:
                 print(f"  {os.path.basename(path)}: {issue}")
         
-        input("\nPress Enter to continue...")
+        self.safe_input("\nPress Enter to continue...")
         
     def full_health_report(self):
         """Generate a comprehensive health report."""
@@ -2890,7 +2937,7 @@ class MediaManager:
         print(f"  - Empty Folders: {report['empty_folders']}")
         
         print(f"\nFull report saved to: {report_filename}")
-        input("\nPress Enter to continue...")
+        self.safe_input("\nPress Enter to continue...")
         
     def smart_organization(self):
         """Smart organization menu for Plex compatibility."""
@@ -3003,7 +3050,7 @@ class MediaManager:
                 if len(non_compliant_tv) > 10:
                     print(f"  ... and {len(non_compliant_tv) - 10} more")
         
-        input("\nPress Enter to continue...")
+        self.safe_input("\nPress Enter to continue...")
         
     def auto_rename_movies(self):
         """Auto-rename movies to Plex format: Movie Title (Year).ext"""
@@ -3014,7 +3061,7 @@ class MediaManager:
         movies_path = os.path.join(self.base_path, "Movies")
         if not os.path.exists(movies_path):
             print("Movies directory not found!")
-            input("\nPress Enter to continue...")
+            self.safe_input("\nPress Enter to continue...")
             return
         
         rename_candidates = []
@@ -3057,7 +3104,7 @@ class MediaManager:
         
         if not rename_candidates:
             print("No movies need renaming!")
-            input("\nPress Enter to continue...")
+            self.safe_input("\nPress Enter to continue...")
             return
         
         print(f"\nFound {len(rename_candidates)} movies to rename:")
@@ -3080,7 +3127,7 @@ class MediaManager:
                     print(f"Error renaming {self.sanitize_path_for_display(old_path)}: {self.sanitize_error_message(str(e))}")
             print(f"✓ Renamed {renamed} movies")
         
-        input("\nPress Enter to continue...")
+        self.safe_input("\nPress Enter to continue...")
         
     def auto_rename_tv_shows(self):
         """Auto-rename TV shows to Plex format: Show Name - S##E## - Episode Title.ext"""
@@ -3091,7 +3138,7 @@ class MediaManager:
         tv_path = os.path.join(self.base_path, "TV")
         if not os.path.exists(tv_path):
             print("TV directory not found!")
-            input("\nPress Enter to continue...")
+            self.safe_input("\nPress Enter to continue...")
             return
         
         rename_candidates = []
@@ -3135,7 +3182,7 @@ class MediaManager:
         
         if not rename_candidates:
             print("No TV episodes need renaming!")
-            input("\nPress Enter to continue...")
+            self.safe_input("\nPress Enter to continue...")
             return
         
         print(f"\nFound {len(rename_candidates)} episodes to rename:")
@@ -3165,7 +3212,7 @@ class MediaManager:
                     print(f"Error renaming {self.sanitize_path_for_display(old_path)}: {self.sanitize_error_message(str(e))}")
             print(f"✓ Renamed {renamed} episodes")
         
-        input("\nPress Enter to continue...")
+        self.safe_input("\nPress Enter to continue...")
         
     def organize_into_folders(self):
         """Organize loose video files into proper folders."""
@@ -3181,7 +3228,7 @@ class MediaManager:
         
         if not loose_files:
             print("No loose video files in root directory!")
-            input("\nPress Enter to continue...")
+            self.safe_input("\nPress Enter to continue...")
             return
         
         print(f"\nFound {len(loose_files)} loose video files:")
@@ -3220,7 +3267,7 @@ class MediaManager:
                 except OSError as e:
                     print(f"Error moving {filename}: {e}")
             print("\n✓ Auto-organization complete!")
-            input("\nPress Enter to continue...")
+            self.safe_input("\nPress Enter to continue...")
             return
         else:
             return
@@ -3239,7 +3286,7 @@ class MediaManager:
                     print(f"Error moving {filename}: {e}")
             print(f"✓ Moved {moved} files to {os.path.basename(target)}/")
         
-        input("\nPress Enter to continue...")
+        self.safe_input("\nPress Enter to continue...")
         
     def fix_season_structure(self):
         """Fix TV show season folder structure."""
@@ -3248,7 +3295,7 @@ class MediaManager:
         tv_path = os.path.join(self.base_path, "TV")
         if not os.path.exists(tv_path):
             print("TV directory not found!")
-            input("\nPress Enter to continue...")
+            self.safe_input("\nPress Enter to continue...")
             return
         
         import re
@@ -3281,7 +3328,7 @@ class MediaManager:
         
         if not shows_to_fix:
             print("✓ All TV shows have proper season structure!")
-            input("\nPress Enter to continue...")
+            self.safe_input("\nPress Enter to continue...")
             return
         
         print(f"\nFound {len(shows_to_fix)} shows needing season folders:")
@@ -3315,7 +3362,7 @@ class MediaManager:
                 
                 print(f"✓ Organized {show}")
         
-        input("\nPress Enter to continue...")
+        self.safe_input("\nPress Enter to continue...")
         
     def organize_subtitles(self):
         """Move subtitle files to match their video files."""
@@ -3346,7 +3393,7 @@ class MediaManager:
         
         if not orphaned_subs:
             print("✓ All subtitle files are properly located!")
-            input("\nPress Enter to continue...")
+            self.safe_input("\nPress Enter to continue...")
             return
         
         print(f"\nFound {len(orphaned_subs)} orphaned subtitle files")
@@ -3392,7 +3439,7 @@ class MediaManager:
                         print(f"Error moving {self.sanitize_path_for_display(old_path)}: {self.sanitize_error_message(str(e))}")
                 print(f"✓ Moved {moved} subtitle files")
         
-        input("\nPress Enter to continue...")
+        self.safe_input("\nPress Enter to continue...")
         
     def storage_analytics(self):
         """Storage analytics menu."""
@@ -3524,7 +3571,7 @@ class MediaManager:
                 bar = "█" * bar_length
                 print(f"  {category:15} {bar}")
         
-        input("\nPress Enter to continue...")
+        self.safe_input("\nPress Enter to continue...")
         
     def growth_trends(self):
         """Analyze storage growth trends."""
@@ -3556,7 +3603,7 @@ class MediaManager:
         
         if not monthly_data:
             print("No data available for growth analysis.")
-            input("\nPress Enter to continue...")
+            self.safe_input("\nPress Enter to continue...")
             return
         
         # Sort by month
@@ -3597,7 +3644,7 @@ class MediaManager:
             bar = "█" * bar_length
             print(f"{month}: {bar} {data['size']/(1024**3):.1f}")
         
-        input("\nPress Enter to continue...")
+        self.safe_input("\nPress Enter to continue...")
         
     def storage_prediction(self):
         """Predict when storage will run out."""
@@ -3686,7 +3733,7 @@ class MediaManager:
         else:
             print("\nInsufficient data for predictions.")
         
-        input("\nPress Enter to continue...")
+        self.safe_input("\nPress Enter to continue...")
         
     def largest_consumers(self):
         """Show largest space consumers."""
@@ -3758,7 +3805,7 @@ class MediaManager:
         if huge_files:
             print(f"\n⚠️  Consider compressing these {len(huge_files)} files over 10 GB!")
         
-        input("\nPress Enter to continue...")
+        self.safe_input("\nPress Enter to continue...")
         
     def recommend_deletions(self):
         """Recommend videos to delete based on various criteria."""
@@ -3895,7 +3942,7 @@ class MediaManager:
                 
                 print("Report saved to: deletion_recommendations.txt")
         
-        input("\nPress Enter to continue...")
+        self.safe_input("\nPress Enter to continue...")
         
     def export_analytics(self):
         """Export comprehensive analytics report."""
@@ -4093,11 +4140,14 @@ class MediaManager:
         print(f"  - {json_file} (JSON format)")
         print(f"  - {txt_file} (Text format)")
         
-        input("\nPress Enter to continue...")
+        self.safe_input("\nPress Enter to continue...")
         
     def run(self):
-        """Main menu loop."""
-        while True:
+        """Main menu loop with safety mechanisms."""
+        self.loop_start_time = time.time()
+        iteration_count = 0
+        
+        while self.running and iteration_count < self.max_menu_iterations:
             self.clear_screen()
             print("="*60)
             print("📺 Media Library Manager")
@@ -4247,9 +4297,20 @@ class MediaManager:
             except KeyboardInterrupt:
                 print("\n\nGoodbye!")
                 break
-            except (ValueError, KeyError, TypeError, OSError, IOError) as e:
-                print(f"\nError: {self.sanitize_error_message(str(e))}")
-                self.safe_input("\nPress Enter to continue...")
+            
+            # Safety mechanisms to prevent infinite loops
+            iteration_count += 1
+            
+            # Check for excessive runtime (1 hour timeout)
+            if time.time() - self.loop_start_time > 3600:
+                print("⚠️  Menu timeout reached after 1 hour. Exiting for safety.")
+                break
+        
+        # Check if loop exited due to safety limits
+        if iteration_count >= self.max_menu_iterations:
+            print("⚠️  Maximum menu iterations reached. Exiting for safety.")
+        elif not self.running:
+            print("⚠️  Application shutdown requested.")
         
     def batch_operations(self):
         """Batch operations menu for bulk actions."""
@@ -4475,7 +4536,7 @@ class MediaManager:
         
         if not matching_files:
             print(f"\nNo videos found with {from_codec.upper()} codec!")
-            input("\nPress Enter to continue...")
+            self.safe_input("\nPress Enter to continue...")
             return
         
         total_size = sum(f['size_gb'] for f in matching_files)
@@ -4512,7 +4573,7 @@ class MediaManager:
         
         if not matching_files:
             print(f"No {from_ext} files found!")
-            input("\nPress Enter to continue...")
+            self.safe_input("\nPress Enter to continue...")
             return
         
         total_size = sum(f['size_gb'] for f in matching_files)
@@ -4555,7 +4616,7 @@ class MediaManager:
             
             print("\n✓ Batch conversion complete!")
         
-        input("\nPress Enter to continue...")
+        self.safe_input("\nPress Enter to continue...")
         
     def batch_delete_by_resolution(self, min_height):
         """Delete all videos below specified resolution."""
@@ -4593,7 +4654,7 @@ class MediaManager:
         
         if not low_res_files:
             print(f"\nNo videos found below {min_height}p!")
-            input("\nPress Enter to continue...")
+            self.safe_input("\nPress Enter to continue...")
             return
         
         total_size = sum(f['size_gb'] for f in low_res_files)
@@ -4623,7 +4684,7 @@ class MediaManager:
             print(f"\n✓ Deleted {deleted} low-resolution videos")
             print(f"Freed up {total_size:.2f} GB of space")
         
-        input("\nPress Enter to continue...")
+        self.safe_input("\nPress Enter to continue...")
         
     def batch_remove_text(self, text_to_remove):
         """Remove specific text from all filenames."""
@@ -4645,7 +4706,7 @@ class MediaManager:
         
         if not files_to_rename:
             print(f"No files found containing '{text_to_remove}'!")
-            input("\nPress Enter to continue...")
+            self.safe_input("\nPress Enter to continue...")
             return
         
         print(f"\nFound {len(files_to_rename)} files to rename:")
@@ -4669,7 +4730,7 @@ class MediaManager:
             
             print(f"✓ Renamed {renamed} files")
         
-        input("\nPress Enter to continue...")
+        self.safe_input("\nPress Enter to continue...")
         
     def batch_extract_subtitles(self):
         """Extract embedded subtitles to external .srt files."""
@@ -4701,7 +4762,7 @@ class MediaManager:
         
         if not videos_with_subs:
             print(f"\nNo videos found with embedded English subtitles!")
-            input("\nPress Enter to continue...")
+            self.safe_input("\nPress Enter to continue...")
             return
         
         print(f"\n\nFound {len(videos_with_subs)} videos with embedded subtitles")
@@ -4745,7 +4806,7 @@ class MediaManager:
             
             print(f"\n✓ Extracted subtitles from {extracted} videos")
         
-        input("\nPress Enter to continue...")
+        self.safe_input("\nPress Enter to continue...")
         
     def batch_delete_by_size(self, min_size_mb):
         """Delete videos smaller than specified size."""
@@ -4771,7 +4832,7 @@ class MediaManager:
         
         if not small_files:
             print(f"No videos found smaller than {min_size_mb} MB!")
-            input("\nPress Enter to continue...")
+            self.safe_input("\nPress Enter to continue...")
             return
         
         print(f"\nFound {len(small_files)} small videos:")
@@ -4791,7 +4852,7 @@ class MediaManager:
             
             print(f"\n✓ Deleted {len(small_files)} small videos")
         
-        input("\nPress Enter to continue...")
+        self.safe_input("\nPress Enter to continue...")
     
     def background_analysis(self):
         """Comprehensive background analysis with progress tracking and caching."""
@@ -5445,7 +5506,7 @@ class MediaManager:
                     for task_result in found['background_tasks'][-5:]:
                         print(f"   {task_result}")
         
-        input("\nPress Enter to continue...")
+        self.safe_input("\nPress Enter to continue...")
     
     def rebuild_analysis_from_db(self):
         """Rebuild analysis results from database."""
@@ -5535,7 +5596,7 @@ class MediaManager:
             
             if not sessions:
                 print("No previous analysis sessions found.")
-                input("\nPress Enter to continue...")
+                self.safe_input("\nPress Enter to continue...")
                 return
             
             print("Recent analysis sessions:")
@@ -5620,7 +5681,7 @@ class MediaManager:
                 print("  Ubuntu/Debian: apt install rclone")
                 print("  RHEL/CentOS: yum install rclone") 
                 print("  Manual: Download from https://rclone.org/downloads/")
-                input("\nPress Enter to continue...")
+                self.safe_input("\nPress Enter to continue...")
                 return
             
             # Get configured remotes
@@ -5631,7 +5692,7 @@ class MediaManager:
                 print("\nTo configure a remote:")
                 print("  Run: rclone config")
                 print("  Follow prompts to add cloud storage (Google Drive, S3, etc.)")
-                input("\nPress Enter to continue...")
+                self.safe_input("\nPress Enter to continue...")
                 return
             
             print("✅ rclone installed and configured")
@@ -5808,7 +5869,7 @@ class MediaManager:
             except (subprocess.SubprocessError, OSError, IOError) as e:
                 print(f"❌ Error during {sync_cmd}: {self.sanitize_error_message(str(e))}")
         
-        input("\nPress Enter to continue...")
+        self.safe_input("\nPress Enter to continue...")
     
     def full_backup(self, remotes):
         """Backup entire media library to cloud."""
@@ -5912,7 +5973,7 @@ class MediaManager:
         except (subprocess.SubprocessError, OSError, IOError) as e:
             print(f"\n❌ Backup failed: {self.sanitize_error_message(str(e))}")
         
-        input("\nPress Enter to continue...")
+        self.safe_input("\nPress Enter to continue...")
     
     def download_from_cloud(self, remotes):
         """Download files from cloud storage."""
@@ -6023,7 +6084,7 @@ class MediaManager:
         except (ValueError, IndexError, subprocess.SubprocessError, OSError) as e:
             print(f"❌ Error accessing remote: {self.sanitize_error_message(str(e))}")
         
-        input("\nPress Enter to continue...")
+        self.safe_input("\nPress Enter to continue...")
     
     def check_sync_status(self, remotes):
         """Check synchronization status between local and remote."""
@@ -6079,7 +6140,7 @@ class MediaManager:
         except (subprocess.SubprocessError, OSError, IOError) as e:
             print(f"❌ Error checking sync status: {self.sanitize_error_message(str(e))}")
         
-        input("\nPress Enter to continue...")
+        self.safe_input("\nPress Enter to continue...")
     
     def configure_bandwidth(self):
         """Configure bandwidth limits for rclone operations."""
@@ -6125,7 +6186,7 @@ class MediaManager:
             print(f"✅ Custom bandwidth limit: {custom_limit}")
             print(f"💡 Add --bwlimit {custom_limit} to rclone commands")
         
-        input("\nPress Enter to continue...")
+        self.safe_input("\nPress Enter to continue...")
     
     def verify_backup_integrity(self, remotes):
         """Verify backup integrity using checksums."""
@@ -6175,7 +6236,7 @@ class MediaManager:
         except (subprocess.SubprocessError, OSError, IOError) as e:
             print(f"❌ Verification failed: {self.sanitize_error_message(str(e))}")
         
-        input("\nPress Enter to continue...")
+        self.safe_input("\nPress Enter to continue...")
     
     def view_rclone_config(self):
         """View rclone configuration details."""
@@ -6228,7 +6289,7 @@ class MediaManager:
         print("   rclone about remote:   - Show storage info")
         print("   rclone ls remote:      - List files on remote")
         
-        input("\nPress Enter to continue...")
+        self.safe_input("\nPress Enter to continue...")
 
 if __name__ == "__main__":
     # Validate command line arguments for security
