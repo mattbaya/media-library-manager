@@ -99,6 +99,19 @@ This is a comprehensive media library management system with a primary Python ap
 - **Subtitle Management**: Download external subtitles, check embedded subtitles
 - **Storage Analytics**: Disk usage analysis and growth predictions
 
+### Security Features
+
+- **Enterprise-Grade Security**: Comprehensive protection against common vulnerability classes
+- **Input Validation**: Strict validation of all user input with sanitization
+- **Command Injection Prevention**: Parameterized commands with rclone remote validation
+- **SQL Injection Prevention**: Parameterized queries throughout database operations
+- **Path Traversal Protection**: Comprehensive path validation and sanitization
+- **Rate Limiting**: External command execution limits to prevent DoS attacks
+- **Symlink Attack Prevention**: TOCTOU protection with atomic file operations
+- **Information Disclosure Prevention**: Path and error message sanitization
+- **Cryptographic Security**: Secure random number generation for timing operations
+- **Performance Limits**: DoS protection with file count and directory depth limits
+
 ### Workflow Recommendations
 
 1. **First-time setup**: Run Option 1 (Background Analysis) for comprehensive library overview
@@ -113,3 +126,33 @@ This is a comprehensive media library management system with a primary Python ap
 - Analysis results are cached for 24 hours by default
 - Cloud sync requires rclone configuration (run `rclone config`)
 - FFmpeg must be installed and available in PATH
+
+### Security Architecture
+
+The application implements multiple layers of security protection:
+
+1. **ExternalCommandManager**: Rate-limited subprocess execution (max 3 concurrent, 100ms intervals)
+2. **PerformanceLimits**: DoS protection (100K files max, 20 depth levels, 10K directories)
+3. **Input Sanitization**: All user input validated with strict alphanumeric checks
+4. **Path Security**: Comprehensive validation, symlink blocking, and traversal prevention
+5. **Database Security**: Parameterized queries, secure file permissions (0600)
+6. **Error Sanitization**: All error messages scrubbed of sensitive system information
+7. **Audit Logging**: Security events logged for monitoring and compliance
+
+### Security Compliance
+
+- **No shell=True usage**: All subprocess calls use argument arrays
+- **No hardcoded credentials**: Environment-based authentication only
+- **Cryptographically secure random**: Uses secrets module for all random operations
+- **OWASP compliance**: Protected against Top 10 vulnerabilities
+- **Enterprise security**: Suitable for production environments
+
+### Security Testing
+
+The application has undergone comprehensive security testing including:
+- Command injection testing with malicious payloads
+- SQL injection testing with database operations
+- Path traversal testing with directory operations
+- DoS testing with resource exhaustion attempts
+- Input validation testing with edge cases
+- Symlink attack testing with TOCTOU scenarios

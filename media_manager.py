@@ -14,8 +14,11 @@ import hashlib
 import queue
 import unicodedata
 import random
+import secrets
 import signal
 from concurrent.futures import ThreadPoolExecutor, as_completed
+import errno
+import stat
 
 # Safe file size constants to prevent integer overflow
 class FileSizeConstants:
@@ -29,6 +32,17 @@ class FileSizeConstants:
     LARGE_FILE_THRESHOLD = 5 * GB
     HUGE_FILE_THRESHOLD = 10 * GB
     SAMPLE_FILE_MAX = 100 * MB
+
+# Performance and DoS prevention constants
+class PerformanceLimits:
+    # Prevent DoS via excessive file scanning
+    MAX_FILES_PER_SCAN = 100000  # 100K files max per scan operation
+    MAX_DIRECTORIES_PER_SCAN = 10000  # 10K directories max
+    MAX_SCAN_DEPTH = 20  # Maximum directory depth
+    
+    # Memory usage limits
+    MAX_MEMORY_ITEMS = 50000  # Max items to keep in memory at once
+    BATCH_SIZE = 1000  # Process files in batches
 
 # Standardized timeout constants to prevent DoS attacks
 class TimeoutConstants:
@@ -46,6 +60,65 @@ class TimeoutConstants:
     
     # Database connections
     DATABASE = 30.0
+
+class ExternalCommandManager:
+    """Manages external command execution with rate limiting and concurrency controls."""
+    
+    def __init__(self, max_concurrent=4):
+        self.max_concurrent = max_concurrent
+        self.executor = ThreadPoolExecutor(max_workers=max_concurrent)
+        self.active_commands = {}
+        self.command_lock = threading.Lock()
+        self.command_count = 0
+        self.last_command_time = 0
+        self.min_command_interval = 0.1  # 100ms between commands
+    
+    def safe_subprocess_run(self, cmd, **kwargs):
+        """Execute subprocess with concurrency and rate limits."""
+        current_time = time.time()
+        
+        # Rate limiting - prevent too rapid command execution
+        with self.command_lock:
+            time_since_last = current_time - self.last_command_time
+            if time_since_last < self.min_command_interval:
+                time.sleep(self.min_command_interval - time_since_last)
+            
+            self.last_command_time = time.time()
+            self.command_count += 1
+        
+        # Check if we're at concurrent command limit
+        with self.command_lock:
+            if len(self.active_commands) >= self.max_concurrent:
+                # Wait for a command to complete
+                time.sleep(0.5)
+        
+        # Submit to executor with timeout
+        future = self.executor.submit(subprocess.run, cmd, **kwargs)
+        
+        # Track active command
+        cmd_id = id(future)
+        with self.command_lock:
+            self.active_commands[cmd_id] = {
+                'cmd': cmd[:3] if cmd else 'unknown',  # First 3 elements only for security
+                'start_time': time.time()
+            }
+        
+        try:
+            # Default timeout if not specified
+            timeout = kwargs.get('timeout', TimeoutConstants.MEDIUM)
+            result = future.result(timeout=timeout)
+            return result
+        except Exception as e:
+            # Log command failure for security monitoring
+            return type('SubprocessResult', (), {
+                'returncode': -1, 
+                'stdout': '', 
+                'stderr': f'Command execution failed: {str(e)[:100]}'
+            })()
+        finally:
+            # Remove from active tracking
+            with self.command_lock:
+                self.active_commands.pop(cmd_id, None)
 
 class DatabaseContext:
     """Context manager for safe database connections with automatic cleanup."""
@@ -100,7 +173,11 @@ class MediaManager:
         
         # Set restrictive permissions on database file if it exists
         if os.path.exists(self.db_path):
+            # Set secure permissions and verify
             os.chmod(self.db_path, 0o600)  # Read/write for owner only
+            current_perms = oct(os.stat(self.db_path).st_mode)[-3:]
+            if current_perms != '600':
+                self.security_audit_log("DB_PERMISSION_WARNING", f"Database permissions {current_perms} instead of 600")
         
         # Initialize loop safety mechanisms
         self.max_menu_iterations = 1000  # Safety limit to prevent infinite loops
@@ -110,6 +187,9 @@ class MediaManager:
         # Set up signal handlers for graceful shutdown
         signal.signal(signal.SIGTERM, self.graceful_shutdown)
         signal.signal(signal.SIGINT, self.graceful_shutdown)
+        
+        # Initialize external command manager for rate limiting and security
+        self.cmd_manager = ExternalCommandManager(max_concurrent=3)
         
         # Check dependencies at startup
         self.check_dependencies()
@@ -207,8 +287,12 @@ class MediaManager:
         # Set secure file permissions on database (readable/writable by owner only)
         try:
             os.chmod(self.db_path, 0o600)
+            # Verify permissions were set correctly
+            current_perms = oct(os.stat(self.db_path).st_mode)[-3:]
+            if current_perms != '600':
+                self.security_audit_log("DB_PERMISSION_WARNING", f"Database permissions {current_perms} instead of 600")
         except OSError as e:
-            print(f"Warning: Could not set secure permissions on database: {e}")
+            print(f"Warning: Could not set secure permissions on database: {self.sanitize_error_message(str(e))}")
     
     def security_audit_log(self, operation, details=""):
         """Log security-relevant operations for audit purposes."""
@@ -239,7 +323,12 @@ class MediaManager:
         import re
         sanitized = re.sub(r'/Users/[^/\s]+', '/Users/[USER]', sanitized)
         sanitized = re.sub(r'/home/[^/\s]+', '/home/[USER]', sanitized)
+        sanitized = re.sub(r'/Volumes/[^/\s]+', '/Volumes/[VOLUME]', sanitized)
+        sanitized = re.sub(r'/Applications/[^/\s]+', '/Applications/[APP]', sanitized)
+        sanitized = re.sub(r'/System/[^/\s]+', '/System/[SYSTEM]', sanitized)
+        sanitized = re.sub(r'/Library/[^/\s]+', '/Library/[LIB]', sanitized)
         sanitized = re.sub(r'file://[^\s]+', 'file://[PATH]', sanitized)
+        sanitized = re.sub(r'[a-fA-F0-9]{8}-[a-fA-F0-9]{4}-[a-fA-F0-9]{4}-[a-fA-F0-9]{4}-[a-fA-F0-9]{12}', '[UUID]', sanitized)
         
         return sanitized
     
@@ -260,6 +349,9 @@ class MediaManager:
         sanitized = re.sub(r'/Users/[^/\s]+', '/Users/[USER]', path)
         sanitized = re.sub(r'/home/[^/\s]+', '/home/[USER]', sanitized)
         sanitized = re.sub(r'/Volumes/[^/\s]+', '/Volumes/[VOLUME]', sanitized)
+        sanitized = re.sub(r'/Applications/[^/\s]+', '/Applications/[APP]', sanitized)
+        sanitized = re.sub(r'/System/[^/\s]+', '/System/[SYSTEM]', sanitized)
+        sanitized = re.sub(r'/Library/[^/\s]+', '/Library/[LIB]', sanitized)
         
         return sanitized
     
@@ -398,6 +490,81 @@ class MediaManager:
             return abs_path
         
         return self.safe_input(prompt, None, path_validator)
+    
+    def safe_file_operation_atomic(self, file_path, operation_type="read"):
+        """Perform file operations atomically to prevent TOCTOU attacks."""
+        try:
+            # Check if it's a symlink first
+            if os.path.islink(file_path):
+                self.security_audit_log("SYMLINK_BLOCKED", f"Blocked symlink operation: {self.sanitize_path_for_display(file_path)}")
+                return False, "Symbolic links not allowed"
+            
+            # For read operations, use O_NOFOLLOW to prevent symlink following
+            if operation_type == "read":
+                try:
+                    fd = os.open(file_path, os.O_RDONLY | os.O_NOFOLLOW)
+                    os.close(fd)
+                    return True, "Safe to read"
+                except OSError as e:
+                    if e.errno == errno.ELOOP:
+                        self.security_audit_log("SYMLINK_ATTACK", f"Symlink attack detected: {self.sanitize_path_for_display(file_path)}")
+                        return False, "Symbolic link detected"
+                    return False, f"File access error: {self.sanitize_error_message(str(e))}"
+            
+            # For other operations, do additional validation
+            stat_info = os.lstat(file_path)  # Use lstat to not follow symlinks
+            if stat.S_ISLNK(stat_info.st_mode):
+                self.security_audit_log("SYMLINK_BLOCKED", f"Blocked symlink operation: {self.sanitize_path_for_display(file_path)}")
+                return False, "Symbolic links not allowed"
+                
+            return True, "File operation safe"
+            
+        except OSError as e:
+            return False, f"File validation error: {self.sanitize_error_message(str(e))}"
+    
+    def safe_walk(self, root_path, followlinks=False):
+        """Safe directory walking with DoS protection limits."""
+        file_count = 0
+        dir_count = 0
+        depth = 0
+        
+        try:
+            for current_root, dirs, files in os.walk(root_path, followlinks=followlinks):
+                # Check depth limit
+                relative_path = os.path.relpath(current_root, root_path)
+                current_depth = len(relative_path.split(os.sep)) if relative_path != '.' else 0
+                if current_depth > PerformanceLimits.MAX_SCAN_DEPTH:
+                    self.security_audit_log("SCAN_DEPTH_LIMIT", f"Stopped scan at depth {current_depth}")
+                    break
+                
+                # Check directory count limit
+                dir_count += 1
+                if dir_count > PerformanceLimits.MAX_DIRECTORIES_PER_SCAN:
+                    self.security_audit_log("SCAN_DIR_LIMIT", f"Stopped scan at {dir_count} directories")
+                    break
+                
+                # Filter and count files
+                valid_files = []
+                for file in files:
+                    file_count += 1
+                    if file_count > PerformanceLimits.MAX_FILES_PER_SCAN:
+                        self.security_audit_log("SCAN_FILE_LIMIT", f"Stopped scan at {file_count} files")
+                        return
+                    
+                    file_path = os.path.join(current_root, file)
+                    
+                    # Skip symlinks for security
+                    if os.path.islink(file_path):
+                        self.security_audit_log("SYMLINK_SKIPPED", f"Skipped symlink: {self.sanitize_path_for_display(file_path)}")
+                        continue
+                    
+                    valid_files.append(file)
+                
+                yield current_root, dirs, valid_files
+                
+        except OSError as e:
+            self.security_audit_log("WALK_ERROR", f"Error during directory walk: {self.sanitize_error_message(str(e))}")
+            return
     
     def validate_safe_path(self, path):
         """Validate that a path is safe for operations with strict directory access control."""
@@ -568,12 +735,18 @@ class MediaManager:
             
             # Check file permissions - should not be writable by others
             stat_info = os.stat(python_path)
-            if stat_info.st_mode & 0o022:  # Check if writable by group or others
-                self.security_audit_log("PYTHON_INSECURE_PERMS", f"Python executable has insecure permissions: {python_path}")
+            perms = stat_info.st_mode & 0o777  # Get permission bits
+            if perms & 0o022:  # Check if writable by group or others
+                self.security_audit_log("PYTHON_INSECURE_PERMS", f"Python executable has insecure permissions {oct(perms)}: {python_path}")
+                return False
+            
+            # Additional check: ensure it's actually executable by owner
+            if not (perms & 0o100):  # Owner execute bit not set
+                self.security_audit_log("PYTHON_NOT_EXECUTABLE", f"Python path not executable: {python_path}")
                 return False
             
             # Try to execute it with a simple test to ensure it's actually Python
-            result = subprocess.run([python_path, '-c', 'import sys; print(sys.version_info.major)'], 
+            result = self.cmd_manager.safe_subprocess_run([python_path, '-c', 'import sys; print(sys.version_info.major)'], 
                                   capture_output=True, text=True, timeout=5)
             
             if result.returncode == 0 and result.stdout.strip() == '3':
@@ -633,7 +806,7 @@ class MediaManager:
         self.files_scanned_count = 0
         
         try:
-            for root, dirs, files in os.walk(directory_path, followlinks=False):
+            for root, dirs, files in self.safe_walk(directory_path, followlinks=False):
                 # Check resource limits
                 if self.files_scanned_count >= self.max_files_per_scan:
                     print(f"Warning: File scan limit reached ({self.max_files_per_scan}). Stopping scan.")
@@ -684,7 +857,7 @@ class MediaManager:
                         self.files_scanned_count += 1
                     
                     except UnicodeError as e:
-                        print(f"Warning: Unicode error processing file {file}: {e}")
+                        print(f"Warning: Unicode error processing file {self.sanitize_path_for_display(file)}: {self.sanitize_error_message(str(e))}")
                         continue
                         
         except (OSError, IOError) as e:
@@ -848,7 +1021,7 @@ class MediaManager:
         
         # Check FFmpeg
         try:
-            result = subprocess.run(['ffmpeg', '-version'], capture_output=True, text=True, timeout=TimeoutConstants.QUICK)
+            result = self.cmd_manager.safe_subprocess_run(['ffmpeg', '-version'], capture_output=True, text=True, timeout=TimeoutConstants.QUICK)
             if result.returncode != 0:
                 missing_deps.append("FFmpeg")
         except (subprocess.SubprocessError, FileNotFoundError, subprocess.TimeoutExpired):
@@ -856,7 +1029,7 @@ class MediaManager:
         
         # Check FFprobe
         try:
-            result = subprocess.run(['ffprobe', '-version'], capture_output=True, text=True, timeout=TimeoutConstants.QUICK)
+            result = self.cmd_manager.safe_subprocess_run(['ffprobe', '-version'], capture_output=True, text=True, timeout=TimeoutConstants.QUICK)
             if result.returncode != 0:
                 missing_deps.append("FFprobe")
         except (subprocess.SubprocessError, FileNotFoundError, subprocess.TimeoutExpired):
@@ -889,7 +1062,7 @@ class MediaManager:
         
         # Check rclone
         try:
-            result = subprocess.run(['rclone', 'version'], capture_output=True, text=True, timeout=TimeoutConstants.QUICK)
+            result = self.cmd_manager.safe_subprocess_run(['rclone', 'version'], capture_output=True, text=True, timeout=TimeoutConstants.QUICK)
             self.optional_deps['rclone'] = (result.returncode == 0)
         except (subprocess.SubprocessError, FileNotFoundError, subprocess.TimeoutExpired):
             self.optional_deps['rclone'] = False
@@ -919,7 +1092,7 @@ class MediaManager:
         ]
         
         try:
-            result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, 
+            result = self.cmd_manager.safe_subprocess_run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, 
                                   text=True, timeout=TimeoutConstants.STANDARD)
             if result.returncode == 0:
                 try:
@@ -961,7 +1134,7 @@ class MediaManager:
         ]
         
         try:
-            result = subprocess.run(cmd, capture_output=True, text=True, timeout=TimeoutConstants.LONG)  # 1 hour timeout
+            result = self.cmd_manager.safe_subprocess_run(cmd, capture_output=True, text=True, timeout=TimeoutConstants.LONG)  # 1 hour timeout
             return result.returncode == 0
         except (subprocess.SubprocessError, subprocess.TimeoutExpired):
             return False
@@ -1122,7 +1295,7 @@ class MediaManager:
             self.validate_file_data(file_data)
         except ValueError as e:
             self.security_audit_log("DATA_VALIDATION_FAILED", str(e))
-            print(f"⚠️  Data validation failed: {e}")
+            print(f"⚠️  Data validation failed: {self.sanitize_error_message(str(e))}")
             return False
         
         with self.get_db_context() as conn:
@@ -1394,7 +1567,7 @@ class MediaManager:
                 '-i', file_path
             ]
             
-            result = subprocess.run(cmd, capture_output=True, text=True, timeout=TimeoutConstants.STANDARD)
+            result = self.cmd_manager.safe_subprocess_run(cmd, capture_output=True, text=True, timeout=TimeoutConstants.STANDARD)
             
             if result.returncode == 0:
                 return "File integrity OK"
@@ -1424,7 +1597,7 @@ class MediaManager:
             file_path
         ]
         try:
-            result = subprocess.run(cmd, capture_output=True, text=True, timeout=TimeoutConstants.STANDARD)
+            result = self.cmd_manager.safe_subprocess_run(cmd, capture_output=True, text=True, timeout=TimeoutConstants.STANDARD)
             if result.returncode == 0:
                 try:
                     # Safe JSON parsing with size limit to prevent DoS
@@ -1960,7 +2133,7 @@ class MediaManager:
                     self.security_audit_log("VIDEO_CONVERTED", f"New file: {os.path.splitext(video['path'])[0]}.mp4")
                     print(f"✓ Conversion complete!")
                 except OSError as e:
-                    print(f"✗ Error renaming files: {e}")
+                    print(f"✗ Error renaming files: {self.sanitize_error_message(str(e))}")
             else:
                 print(f"✗ Conversion failed!")
                 # Clean up temporary file on failure
@@ -2008,7 +2181,7 @@ class MediaManager:
             output_file
         ]
         
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=TimeoutConstants.LONG)  # 1 hour timeout
+        result = self.cmd_manager.safe_subprocess_run(cmd, capture_output=True, text=True, timeout=TimeoutConstants.LONG)  # 1 hour timeout
         if result.returncode != 0:
             print("✗ Conversion failed!")
             # Clean up temporary file on failure
@@ -2174,7 +2347,7 @@ class MediaManager:
                 print(f"     File: {os.path.basename(video_path)}")
                 print(f"     Searching providers...")
             
-            result = subprocess.run(cmd, capture_output=True, text=True, timeout=TimeoutConstants.STANDARD)
+            result = self.cmd_manager.safe_subprocess_run(cmd, capture_output=True, text=True, timeout=TimeoutConstants.STANDARD)
             
             # Show subliminal output if there's an error or in verbose mode
             if not quiet and result.stderr:
@@ -2328,7 +2501,7 @@ class MediaManager:
                 try:
                     os.rmdir(folder)
                 except OSError as e:
-                    print(f"Error removing {folder}: {e}")
+                    print(f"Error removing {self.sanitize_path_for_display(folder)}: {self.sanitize_error_message(str(e))}")
             print(f"✓ Removed {len(empty_folders)} empty folders")
         
         self.safe_input("\nPress Enter to continue...")
@@ -2796,7 +2969,7 @@ class MediaManager:
                         file_path
                     ]
                     
-                    result = subprocess.run(cmd, capture_output=True, text=True, timeout=TimeoutConstants.STANDARD)
+                    result = self.cmd_manager.safe_subprocess_run(cmd, capture_output=True, text=True, timeout=TimeoutConstants.STANDARD)
                     if result.returncode != 0 or not result.stdout.strip():
                         corrupted_files.append(file_path)
         
@@ -3373,7 +3546,7 @@ class MediaManager:
                     os.rename(file_path, new_path)
                     print(f"Moved {filename} to {os.path.basename(target)}/")
                 except OSError as e:
-                    print(f"Error moving {filename}: {e}")
+                    print(f"Error moving {self.sanitize_path_for_display(filename)}: {self.sanitize_error_message(str(e))}")
             print("\n✓ Auto-organization complete!")
             self.safe_input("\nPress Enter to continue...")
             return
@@ -3391,7 +3564,7 @@ class MediaManager:
                     os.rename(file_path, new_path)
                     moved += 1
                 except OSError as e:
-                    print(f"Error moving {filename}: {e}")
+                    print(f"Error moving {self.sanitize_path_for_display(filename)}: {self.sanitize_error_message(str(e))}")
             print(f"✓ Moved {moved} files to {os.path.basename(target)}/")
         
         self.safe_input("\nPress Enter to continue...")
@@ -3466,7 +3639,7 @@ class MediaManager:
                         try:
                             os.rename(file_path, new_path)
                         except OSError as e:
-                            print(f"Error moving {filename}: {e}")
+                            print(f"Error moving {self.sanitize_path_for_display(filename)}: {self.sanitize_error_message(str(e))}")
                 
                 print(f"✓ Organized {show}")
         
@@ -4303,7 +4476,19 @@ class MediaManager:
                     time.sleep(2)  # Force a small delay before showing menu again
                     continue
                 
-                choice = self.safe_input("Enter your choice: ")
+                # Menu choice validator to prevent injection attacks
+                def menu_validator(value):
+                    # Only allow simple numeric choices and '0'
+                    if not value or not value.strip():
+                        return None
+                    value = value.strip()
+                    # Block any non-alphanumeric characters that could be injection attempts
+                    if not value.replace('-', '').isalnum() or len(value) > 3:
+                        print("Invalid menu choice. Please enter a number (0-18).")
+                        return None
+                    return value
+                
+                choice = self.safe_input("Enter your choice: ", validator=menu_validator)
                 
                 if choice == '1':
                     if self.check_rate_limit("background_analysis"):
@@ -4714,7 +4899,7 @@ class MediaManager:
                     "-y", output_path
                 ]
                 
-                result = subprocess.run(cmd, capture_output=True, timeout=TimeoutConstants.LONG)
+                result = self.cmd_manager.safe_subprocess_run(cmd, capture_output=True, timeout=TimeoutConstants.LONG)
                 if result.returncode == 0:
                     backup_path = f"{os.path.splitext(input_path)[0]}-ORIGINAL{from_ext}"
                     os.rename(input_path, backup_path)
@@ -4905,7 +5090,7 @@ class MediaManager:
                     "-y", output_srt
                 ]
                 
-                result = subprocess.run(cmd, capture_output=True, timeout=TimeoutConstants.MEDIUM)  # 5 minute timeout for subtitle extraction
+                result = self.cmd_manager.safe_subprocess_run(cmd, capture_output=True, timeout=TimeoutConstants.MEDIUM)  # 5 minute timeout for subtitle extraction
                 if result.returncode == 0:
                     extracted += 1
                     print(f"     ✓ Extracted to {os.path.basename(output_srt)}")
@@ -5127,7 +5312,7 @@ class MediaManager:
                     for task_result in recent_completed:
                         print(f"   {task_result}")
                 
-                time.sleep(0.5 + random.uniform(0, 0.1))  # Add jitter to prevent timing attacks
+                time.sleep(0.5 + secrets.SystemRandom().uniform(0, 0.1))  # Cryptographically secure jitter
         
         # Start progress display in background thread
         progress_thread = threading.Thread(target=update_progress_display, daemon=True)
@@ -5165,7 +5350,7 @@ class MediaManager:
             with self._progress_lock:
                 progress['file_scan']['current'] = i + 1
             analysis_results['files_scanned'] = i + 1
-            time.sleep(0.001 + random.uniform(0, 0.0005))  # Jitter for timing attack prevention
+            time.sleep(0.001 + secrets.SystemRandom().uniform(0, 0.0005))  # Cryptographically secure jitter
         
         with self._progress_lock:
             progress['file_scan']['complete'] = True
@@ -5364,7 +5549,7 @@ class MediaManager:
                 print(f"Error analyzing {file_path}: {self.sanitize_error_message(str(e))}")
                 continue
             
-            time.sleep(0.001 + random.uniform(0, 0.0005))  # Jitter for timing attack prevention
+            time.sleep(0.001 + secrets.SystemRandom().uniform(0, 0.0005))  # Cryptographically secure jitter
         
         with self._progress_lock:
             progress['resolution_analysis']['complete'] = True
@@ -5394,13 +5579,13 @@ class MediaManager:
                     task_desc = f"Check integrity: {os.path.basename(file_path)}"
                     self.add_background_task('corruption', file_path, self.check_video_corruption_task, task_desc)
                 
-                time.sleep(0.001 + random.uniform(0, 0.0005))  # Jitter for timing attack prevention
+                time.sleep(0.001 + secrets.SystemRandom().uniform(0, 0.0005))  # Cryptographically secure jitter
         
         with self._progress_lock:
             progress['corruption_check']['complete'] = True
         
         # Wait for progress display to finish
-        time.sleep(1 + random.uniform(0, 0.2))  # Add jitter to prevent timing attacks
+        time.sleep(1 + secrets.SystemRandom().uniform(0, 0.2))  # Add jitter to prevent timing attacks
         
         # Scan for system files with auto-remove option
         print("\n🗑️  Scanning for system files...")
@@ -5756,7 +5941,7 @@ class MediaManager:
     def check_rclone_installed(self):
         """Check if rclone is installed and configured."""
         try:
-            result = subprocess.run(['rclone', 'version'], capture_output=True, text=True, timeout=TimeoutConstants.QUICK)
+            result = self.cmd_manager.safe_subprocess_run(['rclone', 'version'], capture_output=True, text=True, timeout=TimeoutConstants.QUICK)
             if result.returncode == 0:
                 return True
         except FileNotFoundError:
@@ -5766,12 +5951,12 @@ class MediaManager:
     def get_rclone_remotes(self):
         """Get list of configured rclone remotes."""
         try:
-            result = subprocess.run(['rclone', 'listremotes'], capture_output=True, text=True, timeout=TimeoutConstants.QUICK)
+            result = self.cmd_manager.safe_subprocess_run(['rclone', 'listremotes'], capture_output=True, text=True, timeout=TimeoutConstants.QUICK)
             if result.returncode == 0:
                 remotes = [line.strip().rstrip(':') for line in result.stdout.strip().split('\n') if line.strip()]
                 return remotes
         except (subprocess.SubprocessError, OSError) as e:
-            print(f"Warning: Could not list rclone remotes: {e}")
+            print(f"Warning: Could not list rclone remotes: {self.sanitize_error_message(str(e))}")
             pass
         return []
     
@@ -5971,7 +6156,7 @@ class MediaManager:
             print(f"Command: {' '.join(cmd)}")
             try:
                 self.security_audit_log("CLOUD_SYNC_STARTED", f"Command: {sync_cmd}, Remote: {selected_remote}, Dir: {dir_name}")
-                result = subprocess.run(cmd, capture_output=True, text=True, timeout=TimeoutConstants.LONG)
+                result = self.cmd_manager.safe_subprocess_run(cmd, capture_output=True, text=True, timeout=TimeoutConstants.LONG)
                 # Display output safely
                 if result.stdout:
                     print(result.stdout)
@@ -6090,7 +6275,7 @@ class MediaManager:
         print(f"💡 Press Ctrl+C to safely stop the backup\n")
         
         try:
-            result = subprocess.run(cmd, capture_output=True, text=True)
+            result = self.cmd_manager.safe_subprocess_run(cmd, capture_output=True, text=True)
             if result.returncode == 0:
                 print(f"\n✅ Backup completed successfully!")
             else:
@@ -6133,7 +6318,7 @@ class MediaManager:
         # List remote directories
         print(f"\nScanning {selected_remote} for directories...")
         try:
-            result = subprocess.run([
+            result = self.cmd_manager.safe_subprocess_run([
                 'rclone', 'lsd', f"{selected_remote}:"
             ], capture_output=True, text=True)
             
@@ -6198,7 +6383,7 @@ class MediaManager:
                     ]
                     
                     try:
-                        result = subprocess.run(cmd, capture_output=True, text=True, timeout=TimeoutConstants.LONG)
+                        result = self.cmd_manager.safe_subprocess_run(cmd, capture_output=True, text=True, timeout=TimeoutConstants.LONG)
                         # Display output safely
                         if result.stdout:
                             print(result.stdout)
@@ -6265,7 +6450,7 @@ class MediaManager:
         print(f"Running: {' '.join(cmd)}")
         
         try:
-            result = subprocess.run(cmd, capture_output=True, text=True, timeout=TimeoutConstants.STANDARD)
+            result = self.cmd_manager.safe_subprocess_run(cmd, capture_output=True, text=True, timeout=TimeoutConstants.STANDARD)
             
             if result.returncode == 0:
                 print("✅ Local and remote are in sync!")
@@ -6294,7 +6479,7 @@ class MediaManager:
         
         print("Current rclone configuration file location:")
         try:
-            result = subprocess.run(['rclone', 'config', 'file'], capture_output=True, text=True, timeout=TimeoutConstants.QUICK)
+            result = self.cmd_manager.safe_subprocess_run(['rclone', 'config', 'file'], capture_output=True, text=True, timeout=TimeoutConstants.QUICK)
             if result.returncode == 0:
                 print(f"📁 {result.stdout.strip()}")
         except (subprocess.SubprocessError, OSError) as e:
@@ -6377,7 +6562,7 @@ class MediaManager:
         print(f"\n🚀 Starting integrity check...")
         
         try:
-            result = subprocess.run(cmd, capture_output=True, text=True)
+            result = self.cmd_manager.safe_subprocess_run(cmd, capture_output=True, text=True)
             if result.returncode == 0:
                 print("✅ All files verified successfully!")
             else:
@@ -6398,7 +6583,7 @@ class MediaManager:
         
         try:
             # Show config file location
-            result = subprocess.run(['rclone', 'config', 'file'], capture_output=True, text=True, timeout=TimeoutConstants.QUICK)
+            result = self.cmd_manager.safe_subprocess_run(['rclone', 'config', 'file'], capture_output=True, text=True, timeout=TimeoutConstants.QUICK)
             if result.returncode == 0:
                 print(f"📁 Config file: {result.stdout.strip()}")
         except (subprocess.SubprocessError, OSError) as e:
@@ -6406,7 +6591,7 @@ class MediaManager:
         
         # Show remotes with details
         try:
-            result = subprocess.run(['rclone', 'config', 'show'], capture_output=True, text=True, timeout=TimeoutConstants.QUICK)
+            result = self.cmd_manager.safe_subprocess_run(['rclone', 'config', 'show'], capture_output=True, text=True, timeout=TimeoutConstants.QUICK)
             if result.returncode == 0:
                 print(f"\n📡 Configured remotes:")
                 # Filter out sensitive information from config output
