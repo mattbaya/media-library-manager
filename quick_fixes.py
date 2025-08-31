@@ -174,12 +174,48 @@ if __name__ == "__main__":
             print(f"Error: {base_path} is not a directory")
             sys.exit(1)
         
-        # Basic security check - prevent operations on system directories
-        dangerous_paths = ['/', '/etc', '/usr', '/bin', '/sbin', '/System', '/Library']
+        # Basic security check - prevent operations on critical system directories
+        critical_forbidden = [
+            '/', '/etc', '/usr/bin', '/usr/sbin', '/bin', '/sbin', 
+            '/sys', '/proc', '/boot', '/dev', '/var/log', '/var/lib'
+        ]
         real_path = os.path.realpath(base_path)
-        if any(real_path.startswith(danger) for danger in dangerous_paths):
-            print(f"Error: Cannot operate on system directory {real_path}")
-            sys.exit(1)
+        
+        # Check critical paths (exact match or subdirectory)
+        for forbidden_path in critical_forbidden:
+            if real_path == forbidden_path or real_path.startswith(forbidden_path + '/'):
+                print(f"Error: Cannot operate on critical system directory {real_path}")
+                sys.exit(1)
+        
+        # Allow common legitimate media locations
+        import fnmatch
+        allowed_patterns = [
+            '/Users/*/Movies*', '/Users/*/Videos*', '/Users/*/Desktop*', '/Users/*/Documents*',
+            '/Volumes/*/Movies*', '/Volumes/*/Videos*', '/Volumes/*/media*', '/Volumes/*/Media*',
+            '/home/*/Videos*', '/home/*/Movies*', '/home/*/media*',
+            '/tmp/video*', '/tmp/media*', '/tmp/test*', '/tmp/*'
+        ]
+        
+        # Check if path matches allowed patterns
+        allowed = False
+        for pattern in allowed_patterns:
+            if fnmatch.fnmatch(real_path, pattern):
+                allowed = True
+                break
+        
+        # For unrecognized paths, require explicit confirmation
+        if not allowed:
+            print(f"\n⚠️  Warning: {real_path} is not a recognized media directory")
+            print("This could be a security risk if the path contains system files.")
+            
+            try:
+                response = input("Process this directory anyway? (y/N): ").strip().lower()
+                if response != 'y':
+                    print("❌ Directory processing rejected by user")
+                    sys.exit(0)
+            except (EOFError, KeyboardInterrupt):
+                print("\n❌ Directory processing cancelled")
+                sys.exit(0)
             
     else:
         base_path = default_path

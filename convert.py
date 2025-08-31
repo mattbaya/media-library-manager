@@ -146,33 +146,58 @@ def process_directory(directory):
                     print(f"No conversion needed for {file_path}")
 
 def validate_safe_directory(directory):
-    """Validate directory is safe to process."""
+    """Validate directory is safe to process media files."""
     
     # Get absolute path and resolve symlinks
     abs_dir = os.path.abspath(os.path.realpath(directory))
     
-    # Forbidden system directories
-    forbidden = [
-        '/', '/etc', '/usr', '/bin', '/sbin', '/var', '/sys', '/proc',
-        '/System', '/Library', '/Applications', '/Users', '/home', '/root'
+    # Critical system paths that should NEVER be processed
+    critical_forbidden = [
+        '/', '/etc', '/usr/bin', '/usr/sbin', '/bin', '/sbin', 
+        '/sys', '/proc', '/boot', '/dev', '/var/log', '/var/lib'
     ]
     
-    # Check if path starts with any forbidden directory
-    for forbidden_path in forbidden:
-        if abs_dir.startswith(forbidden_path):
-            return False, f"Error: Cannot process system directory {abs_dir}"
+    # Check critical paths (exact match or subdirectory)
+    for forbidden_path in critical_forbidden:
+        if abs_dir == forbidden_path or abs_dir.startswith(forbidden_path + '/'):
+            return False, f"Cannot process critical system directory: {abs_dir}"
     
     # Ensure directory exists and is readable
     if not os.path.exists(abs_dir):
-        return False, f"Error: Directory {abs_dir} does not exist"
+        return False, f"Directory {abs_dir} does not exist"
         
     if not os.path.isdir(abs_dir):
-        return False, f"Error: {abs_dir} is not a directory"
+        return False, f"{abs_dir} is not a directory"
     
     if not os.access(abs_dir, os.R_OK):
-        return False, f"Error: No read permission for {abs_dir}"
+        return False, f"No read permission for {abs_dir}"
     
-    return True, f"Directory {abs_dir} is safe to process"
+    # Allow common legitimate media locations
+    import fnmatch
+    allowed_patterns = [
+        '/Users/*/Movies*', '/Users/*/Videos*', '/Users/*/Desktop*', '/Users/*/Documents*',
+        '/Volumes/*/Movies*', '/Volumes/*/Videos*', '/Volumes/*/media*', '/Volumes/*/Media*',
+        '/home/*/Videos*', '/home/*/Movies*', '/home/*/media*',
+        '/tmp/video*', '/tmp/media*', '/tmp/test*', '/tmp/*'
+    ]
+    
+    # Check if path matches allowed patterns
+    for pattern in allowed_patterns:
+        if fnmatch.fnmatch(abs_dir, pattern):
+            return True, f"Allowed media directory: {abs_dir}"
+    
+    # For other paths, require explicit confirmation
+    print(f"\n⚠️  Warning: {abs_dir} is not a recognized media directory")
+    print("This could be a security risk if the path contains system files.")
+    
+    try:
+        response = input("Process this directory anyway? (y/N): ").strip().lower()
+        if response == 'y':
+            return True, f"User confirmed directory: {abs_dir}"
+        else:
+            return False, "User rejected directory processing"
+    except (EOFError, KeyboardInterrupt):
+        return False, "User cancelled directory processing"
 
 if __name__ == "__main__":
     import sys
