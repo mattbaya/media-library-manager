@@ -1242,6 +1242,50 @@ class MediaManager:
                 print(f"Warning: Could not check file change status for {self.sanitize_path_for_display(file_path)}: {self.sanitize_error_message(str(e))}")
                 return True  # Error, assume changed
     
+    def get_database_status(self):
+        """Get database status including file count and last scan info."""
+        try:
+            with self.get_db_context() as conn:
+                cursor = conn.cursor()
+                
+                # Get total files in database
+                cursor.execute('SELECT COUNT(*) FROM video_files')
+                total_files = cursor.fetchone()[0]
+                
+                # Get last scan time
+                cursor.execute('SELECT MAX(last_scanned) FROM video_files WHERE last_scanned IS NOT NULL')
+                last_scan_timestamp = cursor.fetchone()[0]
+                
+                # Get last analysis session
+                cursor.execute('SELECT MAX(timestamp), total_files FROM analysis_sessions ORDER BY timestamp DESC LIMIT 1')
+                session_row = cursor.fetchone()
+                
+                status = {
+                    'total_files': total_files,
+                    'last_scan': None,
+                    'last_analysis': None,
+                    'session_files': 0
+                }
+                
+                if last_scan_timestamp:
+                    status['last_scan'] = datetime.fromtimestamp(last_scan_timestamp)
+                
+                if session_row and session_row[0]:
+                    status['last_analysis'] = datetime.fromtimestamp(session_row[0])
+                    status['session_files'] = session_row[1] or 0
+                
+                return status
+                
+        except sqlite3.Error as e:
+            self.security_audit_log("DB_STATUS_ERROR", str(e))
+            return {
+                'total_files': 0,
+                'last_scan': None,
+                'last_analysis': None,
+                'session_files': 0,
+                'error': True
+            }
+    
     def validate_file_data(self, file_data):
         """Validate file data before database insertion."""
         required_fields = ['file_path', 'relative_path', 'filename', 'file_size', 'file_modified']
@@ -4434,6 +4478,25 @@ class MediaManager:
             print("📺 Media Library Manager")
             print("="*60)
             print(f"Base Path: {self.base_path}")
+            
+            # Display database status
+            db_status = self.get_database_status()
+            if db_status.get('error'):
+                print("Database Status: ❌ Error accessing database")
+            elif db_status['total_files'] == 0:
+                print("Database Status: 📝 Empty (no files scanned)")
+            else:
+                print(f"Database Status: 📊 {db_status['total_files']:,} files in database")
+                if db_status['last_scan']:
+                    time_since = datetime.now() - db_status['last_scan']
+                    if time_since.days > 0:
+                        print(f"Last Scan: {time_since.days} day(s) ago")
+                    elif time_since.seconds > 3600:
+                        print(f"Last Scan: {time_since.seconds // 3600} hour(s) ago")
+                    else:
+                        print(f"Last Scan: {time_since.seconds // 60} minute(s) ago")
+                else:
+                    print("Last Scan: Never")
             print()
             print("🎯 RECOMMENDED FIRST STEP:")
             print("1. Background Analysis & Recommendations")
@@ -5362,51 +5425,49 @@ class MediaManager:
         
         # Load existing data from database for unchanged files
         if incremental_mode:
-            conn = self.get_db_connection()
-            cursor = conn.cursor()
-            
-            # Get cached data for unchanged files
-            unchanged_files = [f for f in all_video_files if f not in files_to_analyze]
-            for file_path in unchanged_files:
-                # Validate file path before database query
-                if not self.validate_safe_path(file_path):
-                    continue
-                cursor.execute('SELECT * FROM video_files WHERE file_path = ?', (file_path,))
-                row = cursor.fetchone()
-                if row:
-                    # Add to results from cache
-                    if row['needs_conversion']:
-                        analysis_results['conversion_candidates'].append({
-                            'path': file_path,
-                            'width': row['width'],
-                            'height': row['height'], 
-                            'size_gb': row['file_size'] / (1024**3),
-                            'codec': row['codec']
-                        })
-                    
-                    if row['codec'] in ['mpeg4', 'xvid', 'divx', 'wmv3']:
-                        analysis_results['codec_issues'].append({
-                            'path': file_path,
-                            'codec': row['codec']
-                        })
-                    
-                    if row['file_size'] / (1024**3) > 10:
-                        analysis_results['large_files'].append({
-                            'path': file_path,
-                            'size_gb': row['file_size'] / (1024**3),
-                            'resolution': f"{row['width']}x{row['height']}"
-                        })
-                    
-                    if row['naming_issues']:
-                        analysis_results['naming_issues'].append({
-                            'path': file_path,
-                            'issues': row['naming_issues'].split(',')
-                        })
-                    
-                    if not row['has_external_subs'] and not row['has_embedded_subs']:
-                        analysis_results['missing_subtitles'].append(file_path)
-            
-            conn.close()
+            with self.get_db_context() as conn:
+                cursor = conn.cursor()
+                
+                # Get cached data for unchanged files
+                unchanged_files = [f for f in all_video_files if f not in files_to_analyze]
+                for file_path in unchanged_files:
+                    # Validate file path before database query
+                    if not self.validate_safe_path(file_path):
+                        continue
+                    cursor.execute('SELECT * FROM video_files WHERE file_path = ?', (file_path,))
+                    row = cursor.fetchone()
+                    if row:
+                        # Add to results from cache
+                        if row['needs_conversion']:
+                            analysis_results['conversion_candidates'].append({
+                                'path': file_path,
+                                'width': row['width'],
+                                'height': row['height'], 
+                                'size_gb': row['file_size'] / (1024**3),
+                                'codec': row['codec']
+                            })
+                        
+                        if row['codec'] in ['mpeg4', 'xvid', 'divx', 'wmv3']:
+                            analysis_results['codec_issues'].append({
+                                'path': file_path,
+                                'codec': row['codec']
+                            })
+                        
+                        if row['file_size'] / (1024**3) > 10:
+                            analysis_results['large_files'].append({
+                                'path': file_path,
+                                'size_gb': row['file_size'] / (1024**3),
+                                'resolution': f"{row['width']}x{row['height']}"
+                            })
+                        
+                        if row['naming_issues']:
+                            analysis_results['naming_issues'].append({
+                                'path': file_path,
+                                'issues': row['naming_issues'].split(',')
+                            })
+                        
+                        if not row['has_external_subs'] and not row['has_embedded_subs']:
+                            analysis_results['missing_subtitles'].append(file_path)
         
         # Analyze only new/changed files
         for i, file_path in enumerate(files_to_analyze):
@@ -5803,9 +5864,6 @@ class MediaManager:
     
     def rebuild_analysis_from_db(self):
         """Rebuild analysis results from database."""
-        conn = self.get_db_connection()
-        cursor = conn.cursor()
-        
         results = {
             'conversion_candidates': [],
             'naming_issues': [],
@@ -5816,7 +5874,9 @@ class MediaManager:
             'recommendations': []
         }
         
-        try:
+        with self.get_db_context() as conn:
+            cursor = conn.cursor()
+            
             # Get conversion candidates
             cursor.execute('SELECT * FROM video_files WHERE needs_conversion = 1')
             for row in cursor.fetchall():
@@ -5859,9 +5919,6 @@ class MediaManager:
                     'size_gb': row['file_size'] / (1024**3),
                     'resolution': f"{row['width']}x{row['height']}"
                 })
-                
-        finally:
-            conn.close()
             
         # Scan for system files (not cached)
         for root, dirs, files in os.walk(self.base_path, followlinks=False):
@@ -5878,10 +5935,9 @@ class MediaManager:
         print("📋 Previous Analysis Sessions")
         print("="*60)
         
-        conn = self.get_db_connection()
-        cursor = conn.cursor()
-        
-        try:
+        with self.get_db_context() as conn:
+            cursor = conn.cursor()
+            
             cursor.execute('''
                 SELECT * FROM analysis_sessions 
                 ORDER BY timestamp DESC 
@@ -5934,9 +5990,6 @@ class MediaManager:
             except (ValueError, IndexError):
                 print("Invalid selection.")
                 input("Press Enter to continue...")
-                
-        finally:
-            conn.close()
     
     def check_rclone_installed(self):
         """Check if rclone is installed and configured."""

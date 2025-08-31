@@ -92,6 +92,7 @@ This is a comprehensive media library management system with a primary Python ap
 
 - **Background Analysis**: Comprehensive library scanning with visual progress bars
 - **Incremental Scanning**: Only analyzes new/changed files using SQLite cache
+- **Database Status Display**: Main menu shows cached file count and last scan time
 - **Smart Recommendations**: Prioritized action lists based on analysis
 - **Batch Operations**: Bulk processing for codec conversion, quality changes, file management
 - **Cloud Sync**: Full rclone integration for backup to any cloud provider
