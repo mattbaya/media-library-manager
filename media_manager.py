@@ -6065,11 +6065,11 @@ class MediaManager:
                     
                     try:
                         result = subprocess.run(cmd, capture_output=True, text=True, timeout=TimeoutConstants.LONG)
-                # Display output safely
-                if result.stdout:
-                    print(result.stdout)
-                if result.stderr:
-                    print(result.stderr, file=sys.stderr)
+                        # Display output safely
+                        if result.stdout:
+                            print(result.stdout)
+                        if result.stderr:
+                            print(result.stderr, file=sys.stderr)
                         if result.returncode == 0:
                             print(f"✅ {dir_name} downloaded!")
                         else:
