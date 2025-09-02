@@ -38,7 +38,7 @@ This is a comprehensive media library management system with a primary Python ap
 ### Key Components
 
 1. **media_manager.py** - Comprehensive media library management application
-   - 18 menu options organized by category (Analysis, Processing, Subtitles, Organization, Backup)
+   - 20 menu options organized by category (Analysis, Processing, Subtitles, Organization, Backup, Settings)
    - SQLite database for metadata caching and performance
    - Background analysis with progress tracking and recommendations
    - Batch operations for bulk video processing
@@ -46,6 +46,7 @@ This is a comprehensive media library management system with a primary Python ap
    - Smart organization with Plex naming compliance
    - Subtitle management (download and check external/embedded)
    - Storage analytics and duplicate detection
+   - Configurable folder scanning with movie/TV type designation
 
 2. **media_library.db** - SQLite database (auto-created)
    - Caches video metadata (resolution, codec, subtitles, file stats)
@@ -75,9 +76,11 @@ This is a comprehensive media library management system with a primary Python ap
 
 - `/Volumes/media/Video/` - Root media library
   - `Movies/`, `TV/`, `Kids Movies/`, `Christmas/`, `Music Videos/`, `Personal/`, `HalloweenFX/`, `Misc/` - Content directories
+  - `.media-manager/` - Application data directory
+    - `media_library.db` - SQLite metadata cache
+    - `settings.json` - User preferences and configuration
   - `convert_env/` - Python 3.12 virtual environment
   - `PlexDBRepair-master/` - External Plex database repair utility
-  - `media_library.db` - SQLite metadata cache
   - Analysis reports (JSON format with timestamps)
 
 ### Dependencies
@@ -103,6 +106,12 @@ This is a comprehensive media library management system with a primary Python ap
 - **Plex Integration**: Naming compliance and organization for Plex Media Server
 - **Subtitle Management**: Download external subtitles, check embedded subtitles
 - **Storage Analytics**: Disk usage analysis and growth predictions
+- **Configurable Folders**: Define custom folders as movie or TV type (e.g., "80s Movies", "Classic TV")
+- **TV Show Navigation**: Paginated browsing with search, alphabetical sorting, and filtering
+- **Progress Tracking**: Live progress bars for subtitle downloads and TV show renaming
+- **Parallel Processing**: Configurable concurrent subtitle downloads (default: 8)
+- **Language Preferences**: Configure which subtitle languages to keep/remove
+- **Personal Content Exclusion**: Non-TV/Movie folders automatically excluded from media operations
 
 ### Security Features
 

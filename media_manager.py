@@ -13,6 +13,7 @@ import sqlite3
 import hashlib
 import queue
 import unicodedata
+import re
 import random
 import secrets
 import signal
@@ -130,8 +131,6 @@ class DatabaseContext:
     def __enter__(self):
         self.conn = sqlite3.connect(self.db_path, timeout=TimeoutConstants.DATABASE)
         self.conn.row_factory = sqlite3.Row
-        # Enable WAL mode for better concurrent access
-        self.conn.execute('PRAGMA journal_mode=WAL')
         return self.conn
     
     def __exit__(self, exc_type, exc_val, exc_tb):
@@ -158,18 +157,18 @@ class MediaManager:
         
         self.video_extensions = ('.mp4', '.mkv', '.avi', '.mov', '.flv', '.m4v', '.wmv')
         
-        # Store database in secure application directory (not in media directory)
-        if os.name == 'nt':  # Windows
-            app_data = os.path.expandvars('%APPDATA%')
-            db_dir = os.path.join(app_data, 'MediaLibraryManager')
-        else:  # Unix-like (macOS, Linux)
-            home = os.path.expanduser('~')
-            db_dir = os.path.join(home, '.media-library-manager')
+        # Default language preferences - can be modified via settings menu
+        self.preferred_languages = ['en', 'eng', 'english']  # Languages to keep
+        self.max_parallel_downloads = 8  # Default parallel download limit
         
-        # Create secure directory with restrictive permissions
+        # Store database and settings in media directory
+        db_dir = os.path.join(self.base_path, '.media-manager')
+        
+        # Create directory with restrictive permissions
         os.makedirs(db_dir, mode=0o700, exist_ok=True)
         
         self.db_path = os.path.join(db_dir, 'media_library.db')
+        self.settings_file = os.path.join(db_dir, 'settings.json')
         
         # Set restrictive permissions on database file if it exists
         if os.path.exists(self.db_path):
@@ -193,6 +192,9 @@ class MediaManager:
         
         # Check dependencies at startup
         self.check_dependencies()
+        
+        # Load language preferences from settings
+        self.load_settings()
         
         self.init_database()
         
@@ -229,8 +231,7 @@ class MediaManager:
         with self.get_db_context() as conn:
             cursor = conn.cursor()
             
-            # Apply comprehensive security hardening PRAGMAs
-            cursor.execute('PRAGMA journal_mode = WAL')  # Write-Ahead Logging for better concurrency
+            # Apply comprehensive security hardening PRAGMAs (skip journal_mode due to filesystem compatibility)
             cursor.execute('PRAGMA synchronous = FULL')  # Maximum data integrity
             cursor.execute('PRAGMA foreign_keys = ON')   # Enable foreign key constraints
             cursor.execute('PRAGMA secure_delete = ON')  # Overwrite deleted data
@@ -278,11 +279,37 @@ class MediaManager:
                 )
             ''')
             
+            # Create folder configuration table
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS folder_config (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    folder_path TEXT UNIQUE NOT NULL,
+                    folder_type TEXT NOT NULL CHECK(folder_type IN ('movies', 'tv')),
+                    enabled BOOLEAN DEFAULT 1,
+                    last_updated REAL NOT NULL
+                )
+            ''')
+            
+            # Add default folders if not already configured
+            cursor.execute('SELECT COUNT(*) FROM folder_config')
+            if cursor.fetchone()[0] == 0:
+                default_folders = [
+                    (os.path.join(self.base_path, 'Movies'), 'movies'),
+                    (os.path.join(self.base_path, 'TV'), 'tv')
+                ]
+                for folder_path, folder_type in default_folders:
+                    if os.path.exists(folder_path):
+                        cursor.execute('''
+                            INSERT OR IGNORE INTO folder_config (folder_path, folder_type, last_updated)
+                            VALUES (?, ?, ?)
+                        ''', (folder_path, folder_type, time.time()))
+            
             # Create indexes for performance
             cursor.execute('CREATE INDEX IF NOT EXISTS idx_file_path ON video_files(file_path)')
             cursor.execute('CREATE INDEX IF NOT EXISTS idx_file_modified ON video_files(file_modified)')
             cursor.execute('CREATE INDEX IF NOT EXISTS idx_needs_conversion ON video_files(needs_conversion)')
             cursor.execute('CREATE INDEX IF NOT EXISTS idx_naming_issues ON video_files(naming_issues)')
+            cursor.execute('CREATE INDEX IF NOT EXISTS idx_folder_type ON folder_config(folder_type)')
         
         # Set secure file permissions on database (readable/writable by owner only)
         try:
@@ -310,6 +337,37 @@ class MediaManager:
         except (OSError, IOError):
             # Fallback to stderr if file logging fails
             print(f"AUDIT: {log_entry}", file=sys.stderr)
+    
+    def operation_log(self, operation, status, details="", file_path=None):
+        """Log all operations with success/failure status for debugging."""
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        log_entry = f"[{timestamp}] {operation.upper()}: {status}"
+        
+        if file_path:
+            sanitized_path = os.path.relpath(file_path, self.base_path) if file_path.startswith(self.base_path) else "[EXTERNAL_PATH]"
+            log_entry += f" - File: {sanitized_path}"
+        
+        if details:
+            sanitized_details = self.sanitize_error_message(details)
+            log_entry += f" - {sanitized_details}"
+        
+        # Log to operations file
+        ops_log_path = os.path.join(self.base_path, "operations.log")
+        try:
+            if self.validate_safe_path(ops_log_path):
+                with open(ops_log_path, 'a', encoding='utf-8') as f:
+                    f.write(log_entry + '\n')
+        except (OSError, IOError):
+            # Fallback to stderr if file logging fails
+            print(f"OPS_LOG: {log_entry}", file=sys.stderr)
+        
+        # Also print to console in verbose mode (can be toggled later)
+        if not hasattr(self, 'verbose_logging'):
+            self.verbose_logging = True  # Default to verbose for now
+        
+        if self.verbose_logging:
+            status_icon = "✓" if status == "SUCCESS" else "✗" if status == "FAILED" else "ℹ️"
+            print(f"   {status_icon} LOG: {operation} - {status}")
     
     def sanitize_error_message(self, error_msg):
         """Sanitize error messages to prevent information disclosure."""
@@ -1076,6 +1134,272 @@ class MediaManager:
             print("\nPlease install missing dependencies before running.")
             self.cleanup_and_exit(1)
     
+    def load_settings(self):
+        """Load user settings from JSON file."""
+        if os.path.exists(self.settings_file):
+            try:
+                with open(self.settings_file, 'r') as f:
+                    settings = json.load(f)
+                    self.preferred_languages = settings.get('preferred_languages', ['en', 'eng', 'english'])
+                    self.max_parallel_downloads = settings.get('max_parallel_downloads', 8)
+            except (json.JSONDecodeError, IOError):
+                pass  # Use defaults if file is corrupted
+    
+    def save_settings(self):
+        """Save user settings to JSON file."""
+        settings = {
+            'preferred_languages': self.preferred_languages,
+            'max_parallel_downloads': self.max_parallel_downloads
+        }
+        try:
+            with open(self.settings_file, 'w') as f:
+                json.dump(settings, f, indent=2)
+        except IOError:
+            print("Warning: Could not save settings file")
+    
+    def manage_language_preferences(self):
+        """Allow user to configure preferred subtitle languages."""
+        self.clear_screen()
+        print("🌐 Subtitle Language Preferences")
+        print("="*60)
+        print(f"Current preferred languages: {', '.join(self.preferred_languages)}")
+        print(f"Parallel downloads: {self.max_parallel_downloads}")
+        print("\nCommon language codes:")
+        print("  en, eng, english - English")
+        print("  es, spa, spanish - Spanish") 
+        print("  fr, fre, french - French")
+        print("  de, ger, german - German")
+        print("  it, ita, italian - Italian")
+        print("  pt, por, portuguese - Portuguese")
+        print("  ru, rus, russian - Russian")
+        print("  ja, jpn, japanese - Japanese")
+        print("  ko, kor, korean - Korean")
+        print("  zh, chi, chinese - Chinese")
+        
+        print("\nOptions:")
+        print("1. Set new preferred languages")
+        print("2. Add a language to current list")
+        print("3. Remove a language from current list")
+        print("4. Reset to English only")
+        print("5. Set parallel download limit")
+        print("6. Clean up unwanted subtitle files now")
+        print("0. Go back")
+        
+        choice = self.safe_input("\nEnter your choice: ")
+        
+        if choice == '1':
+            new_langs = self.safe_input("Enter preferred languages (comma-separated): ").strip()
+            if new_langs:
+                self.preferred_languages = [lang.strip().lower() for lang in new_langs.split(',') if lang.strip()]
+                self.save_settings()
+                print(f"✓ Updated preferred languages: {', '.join(self.preferred_languages)}")
+        elif choice == '2':
+            new_lang = self.safe_input("Enter language code to add: ").strip().lower()
+            if new_lang and new_lang not in self.preferred_languages:
+                self.preferred_languages.append(new_lang)
+                self.save_settings()
+                print(f"✓ Added {new_lang} to preferred languages")
+        elif choice == '3':
+            if len(self.preferred_languages) > 1:
+                print("Current languages:")
+                for i, lang in enumerate(self.preferred_languages, 1):
+                    print(f"  {i}. {lang}")
+                try:
+                    idx = int(self.safe_input("Enter number to remove: ")) - 1
+                    if 0 <= idx < len(self.preferred_languages):
+                        removed = self.preferred_languages.pop(idx)
+                        self.save_settings()
+                        print(f"✓ Removed {removed} from preferred languages")
+                except ValueError:
+                    print("Invalid selection")
+            else:
+                print("Cannot remove - need at least one preferred language")
+        elif choice == '4':
+            self.preferred_languages = ['en']
+            self.save_settings()
+            print("✓ Reset to English only")
+        elif choice == '5':
+            try:
+                new_limit = int(self.safe_input(f"Enter parallel download limit (1-20, current: {self.max_parallel_downloads}): "))
+                if 1 <= new_limit <= 20:
+                    self.max_parallel_downloads = new_limit
+                    self.save_settings()
+                    print(f"✓ Updated parallel download limit to {new_limit}")
+                else:
+                    print("Invalid limit. Must be between 1 and 20.")
+            except ValueError:
+                print("Invalid number")
+        elif choice == '6':
+            self.cleanup_unwanted_subtitles()
+        
+        if choice in ['1', '2', '3', '4', '5']:
+            self.safe_input("\nPress Enter to continue...")
+    
+    def detect_subtitle_languages(self, video_path):
+        """Detect languages of existing subtitle files for a video."""
+        base_name = os.path.splitext(video_path)[0]
+        video_dir = os.path.dirname(video_path)
+        video_filename = os.path.splitext(os.path.basename(video_path))[0]
+        
+        subtitle_files = []
+        
+        # Common subtitle extensions and language patterns
+        subtitle_exts = ['.srt', '.vtt', '.ass', '.ssa', '.sub']
+        
+        # Find all subtitle files for this video
+        for file in os.listdir(video_dir):
+            if file.startswith(video_filename):
+                for ext in subtitle_exts:
+                    if file.endswith(ext):
+                        full_path = os.path.join(video_dir, file)
+                        subtitle_files.append((full_path, file))
+        
+        # Parse language codes from filenames
+        detected_languages = []
+        for full_path, filename in subtitle_files:
+            # Remove video name and extension to get language part
+            lang_part = filename[len(video_filename):].lower()
+            
+            # Common patterns: .en.srt, .english.srt, .es.srt, .spa.srt, etc.
+            for part in lang_part.split('.'):
+                if part and part not in subtitle_exts:
+                    detected_languages.append((full_path, part))
+        
+        return detected_languages
+    
+    def cleanup_unwanted_subtitles(self):
+        """Remove subtitle files for languages not in preferred list."""
+        self.clear_screen()
+        print("🧹 Subtitle Language Cleanup")
+        print("="*60)
+        print(f"Preferred languages: {', '.join(self.preferred_languages)}")
+        print("This will scan for and remove subtitle files in other languages.")
+        
+        print("\nChoose scope:")
+        print("1. Scan entire library")
+        print("2. Scan Movies only")
+        print("3. Scan TV shows only")
+        print("4. Scan specific directory")
+        print("0. Cancel")
+        
+        scope_choice = self.safe_input("\nEnter your choice: ")
+        
+        if scope_choice == '0':
+            return
+        elif scope_choice == '1':
+            scan_path = self.base_path
+            scope_name = "entire library"
+        elif scope_choice == '2':
+            scan_path = os.path.join(self.base_path, "Movies")
+            scope_name = "Movies"
+        elif scope_choice == '3':
+            scan_path = os.path.join(self.base_path, "TV")
+            scope_name = "TV shows"
+        elif scope_choice == '4':
+            print(f"\nSubdirectories in {self.base_path}:")
+            subdirs = [d for d in os.listdir(self.base_path) if os.path.isdir(os.path.join(self.base_path, d))]
+            for i, subdir in enumerate(subdirs, 1):
+                print(f"  {i}. {subdir}")
+            
+            try:
+                dir_choice = int(self.safe_input("Select directory: ")) - 1
+                if 0 <= dir_choice < len(subdirs):
+                    scan_path = os.path.join(self.base_path, subdirs[dir_choice])
+                    scope_name = subdirs[dir_choice]
+                else:
+                    print("Invalid selection")
+                    self.safe_input("Press Enter to continue...")
+                    return
+            except ValueError:
+                print("Invalid selection")
+                self.safe_input("Press Enter to continue...")
+                return
+        else:
+            print("Invalid choice")
+            self.safe_input("Press Enter to continue...")
+            return
+        
+        if not os.path.exists(scan_path):
+            print(f"Directory not found: {scan_path}")
+            self.safe_input("Press Enter to continue...")
+            return
+        
+        print(f"\n🔍 Scanning {scope_name} for unwanted subtitle files...")
+        
+        # Collect videos and their unwanted subtitles
+        unwanted_files = []
+        video_count = 0
+        
+        for root, dirs, files in os.walk(scan_path, followlinks=False):
+            for file in files:
+                if file.lower().endswith(self.video_extensions):
+                    video_count += 1
+                    video_path = os.path.join(root, file)
+                    
+                    # Get subtitle languages for this video
+                    detected_langs = self.detect_subtitle_languages(video_path)
+                    
+                    # Find unwanted languages
+                    for sub_path, lang_code in detected_langs:
+                        if lang_code not in self.preferred_languages:
+                            unwanted_files.append((sub_path, lang_code, os.path.basename(video_path)))
+        
+        if not unwanted_files:
+            print(f"✅ No unwanted subtitle files found in {scope_name}")
+            print(f"   Scanned {video_count} video files")
+            self.safe_input("\nPress Enter to continue...")
+            return
+        
+        print(f"\n📋 Found {len(unwanted_files)} unwanted subtitle files:")
+        print(f"   Scanned {video_count} video files in {scope_name}")
+        
+        # Group by language for summary
+        lang_counts = {}
+        for _, lang_code, _ in unwanted_files:
+            lang_counts[lang_code] = lang_counts.get(lang_code, 0) + 1
+        
+        print("\nLanguages to be removed:")
+        for lang, count in sorted(lang_counts.items()):
+            print(f"   {lang}: {count} files")
+        
+        # Show first 10 files as examples
+        print(f"\nExample files (showing first 10):")
+        for i, (sub_path, lang_code, video_name) in enumerate(unwanted_files[:10], 1):
+            sub_filename = os.path.basename(sub_path)
+            print(f"   {i:2}. {sub_filename} ({lang_code}) - from {video_name}")
+        
+        if len(unwanted_files) > 10:
+            print(f"   ... and {len(unwanted_files) - 10} more files")
+        
+        print(f"\n⚠️  This will permanently delete {len(unwanted_files)} subtitle files")
+        confirm = self.safe_input("Are you sure you want to proceed? (y/N): ")
+        
+        if confirm.lower() != 'y':
+            print("Cancelled")
+            self.safe_input("Press Enter to continue...")
+            return
+        
+        # Delete the unwanted files
+        deleted_count = 0
+        failed_count = 0
+        
+        for sub_path, lang_code, video_name in unwanted_files:
+            try:
+                if os.path.exists(sub_path):
+                    os.remove(sub_path)
+                    deleted_count += 1
+                    self.operation_log("subtitle_cleanup", "DELETED", f"Removed {lang_code} subtitle", sub_path)
+            except OSError as e:
+                failed_count += 1
+                self.operation_log("subtitle_cleanup", "DELETE_FAILED", str(e), sub_path)
+        
+        print(f"\n✓ Cleanup complete!")
+        print(f"   Deleted: {deleted_count} files")
+        if failed_count > 0:
+            print(f"   Failed: {failed_count} files")
+        
+        self.safe_input("\nPress Enter to continue...")
+    
     def get_video_resolution_safe(self, file_path):
         """Safely get video resolution using FFprobe without temporary scripts."""
         # Validate path first
@@ -1376,6 +1700,84 @@ class MediaManager:
         
         return True
     
+    def save_video_metadata_batch(self, file_data_list, batch_size=100):
+        """Save multiple video metadata records in batches for better performance."""
+        if not file_data_list:
+            return True
+            
+        total_saved = 0
+        errors = []
+        
+        # Process in batches
+        for i in range(0, len(file_data_list), batch_size):
+            batch = file_data_list[i:i + batch_size]
+            
+            # Validate all items in batch first
+            valid_batch = []
+            for file_data in batch:
+                try:
+                    self.validate_file_data(file_data)
+                    valid_batch.append(file_data)
+                except ValueError as e:
+                    errors.append(f"{file_data.get('file_path', 'Unknown')}: {str(e)}")
+                    
+            if not valid_batch:
+                continue
+                
+            # Save batch in single transaction
+            try:
+                with self.get_db_context() as conn:
+                    cursor = conn.cursor()
+                    
+                    for file_data in valid_batch:
+                        cursor.execute('''
+                            INSERT OR REPLACE INTO video_files (
+                                file_path, relative_path, filename, file_size, file_modified,
+                                last_scanned, width, height, duration, codec, bitrate, framerate,
+                                has_external_subs, has_embedded_subs, subtitle_languages,
+                                naming_issues, needs_conversion, conversion_reason, checksum
+                            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        ''', (
+                            file_data['file_path'],
+                            file_data['relative_path'], 
+                            file_data['filename'],
+                            file_data['file_size'],
+                            file_data['file_modified'],
+                            time.time(),
+                            file_data.get('width'),
+                            file_data.get('height'),
+                            file_data.get('duration'),
+                            file_data.get('codec'),
+                            file_data.get('bitrate'),
+                            file_data.get('framerate'),
+                            file_data.get('has_external_subs', False),
+                            file_data.get('has_embedded_subs', False),
+                            file_data.get('subtitle_languages'),
+                            ','.join(file_data.get('naming_issues', [])) if file_data.get('naming_issues') else None,
+                            file_data.get('needs_conversion', False),
+                            file_data.get('conversion_reason'),
+                            file_data.get('checksum')
+                        ))
+                    
+                    total_saved += len(valid_batch)
+                    
+            except sqlite3.Error as e:
+                error_msg = f"Database error saving batch {i//batch_size + 1}: {str(e)}"
+                self.security_audit_log("BATCH_SAVE_ERROR", error_msg)
+                errors.append(error_msg)
+                
+        if errors:
+            print(f"\n⚠️  Saved {total_saved} files with {len(errors)} errors")
+            if len(errors) <= 5:
+                for error in errors:
+                    print(f"   - {error}")
+            else:
+                print(f"   - Showing first 5 errors:")
+                for error in errors[:5]:
+                    print(f"   - {error}")
+                    
+        return total_saved > 0
+    
     def verify_database_integrity(self):
         """Verify database integrity and consistency with file system."""
         print("🔍 Verifying database integrity...")
@@ -1622,6 +2024,203 @@ class MediaManager:
             return "Timeout during check (file may be corrupted)"
         except (subprocess.SubprocessError, OSError, IOError) as e:
             return f"Error checking: {self.sanitize_error_message(str(e))}"
+    
+    def rename_file_task(self, file_path):
+        """Background task for renaming files to fix naming issues."""
+        try:
+            if not os.path.exists(file_path):
+                return f"File not found: {file_path}"
+                
+            directory = os.path.dirname(file_path)
+            filename = os.path.basename(file_path)
+            new_filename = filename
+            
+            # Fix double spaces
+            new_filename = re.sub(r'\s+', ' ', new_filename)
+            
+            # Fix double periods (except for file extension)
+            name, ext = os.path.splitext(new_filename)
+            name = re.sub(r'\.+', '.', name)
+            new_filename = name + ext
+            
+            # Fix TV show naming for Plex (convert common formats to S##E## format)
+            tv_patterns = [
+                (r'(\d+)x(\d+)', r'S\1E\2'),  # 1x01 -> S01E01
+                (r'[Ss](\d{1,2})[Ee](\d{1,2})', lambda m: f'S{m.group(1).zfill(2)}E{m.group(2).zfill(2)}'),  # s1e1 -> S01E01
+            ]
+            
+            for pattern, replacement in tv_patterns:
+                new_filename = re.sub(pattern, replacement, new_filename)
+            
+            # Only rename if changed
+            if new_filename != filename:
+                new_path = os.path.join(directory, new_filename)
+                
+                # Check if target exists
+                if os.path.exists(new_path):
+                    return f"Cannot rename: {new_filename} already exists"
+                
+                os.rename(file_path, new_path)
+                
+                # Update database with new path
+                with self.get_db_context() as conn:
+                    cursor = conn.cursor()
+                    cursor.execute('UPDATE video_files SET file_path = ?, filename = ? WHERE file_path = ?',
+                                 (new_path, new_filename, file_path))
+                
+                return f"Renamed to: {new_filename}"
+            else:
+                return "No renaming needed"
+                
+        except (OSError, IOError) as e:
+            return f"Error renaming: {self.sanitize_error_message(str(e))}"
+    
+    def transcode_video_task(self, file_path):
+        """Background task for transcoding videos to 1080p."""
+        try:
+            if not os.path.exists(file_path):
+                return f"File not found: {file_path}"
+                
+            # Get output path
+            directory = os.path.dirname(file_path)
+            filename = os.path.basename(file_path)
+            name, ext = os.path.splitext(filename)
+            output_path = os.path.join(directory, f"{name}_1080p{ext}")
+            
+            # Check if output already exists
+            if os.path.exists(output_path):
+                return f"Output file already exists: {output_path}"
+            
+            # Build ffmpeg command for 1080p conversion
+            cmd = [
+                'ffmpeg',
+                '-i', file_path,
+                '-vf', 'scale=-2:1080',  # Scale to 1080p height, maintain aspect ratio
+                '-c:v', 'libx264',
+                '-preset', 'slow',
+                '-crf', '23',
+                '-c:a', 'copy',  # Copy audio without re-encoding
+                '-map_metadata', '0',  # Copy all metadata
+                output_path
+            ]
+            
+            # Run conversion (with long timeout for large files)
+            result = self.cmd_manager.safe_subprocess_run(cmd, capture_output=True, text=True, 
+                                                        timeout=TimeoutConstants.LONG)
+            
+            if result.returncode == 0:
+                # Update database to mark as converted
+                original_size = os.path.getsize(file_path)
+                new_size = os.path.getsize(output_path)
+                size_reduction = (1 - new_size/original_size) * 100
+                
+                with self.get_db_context() as conn:
+                    cursor = conn.cursor()
+                    cursor.execute('''UPDATE video_files 
+                                    SET needs_conversion = 0, 
+                                        conversion_reason = ? 
+                                    WHERE file_path = ?''',
+                                 (f"Converted to 1080p, saved {size_reduction:.1f}%", file_path))
+                
+                return f"Transcoded successfully, saved {size_reduction:.1f}% space"
+            else:
+                return f"Transcoding failed: {result.stderr.strip()}"
+                
+        except subprocess.TimeoutExpired:
+            return "Timeout during transcoding"
+        except (subprocess.SubprocessError, OSError, IOError) as e:
+            return f"Error transcoding: {self.sanitize_error_message(str(e))}"
+    
+    def optimize_container_task(self, file_path):
+        """Background task for converting problematic containers to MP4."""
+        try:
+            if not os.path.exists(file_path):
+                return f"File not found: {file_path}"
+                
+            # Get output path (same name but .mp4 extension)
+            directory = os.path.dirname(file_path)
+            filename = os.path.basename(file_path)
+            name, old_ext = os.path.splitext(filename)
+            output_path = os.path.join(directory, f"{name}.mp4")
+            
+            # Check if output already exists
+            if os.path.exists(output_path):
+                return f"MP4 version already exists: {output_path}"
+            
+            # Build ffmpeg command for container conversion
+            # Use stream copy when possible to avoid re-encoding
+            cmd = [
+                'ffmpeg',
+                '-i', file_path,
+                '-c', 'copy',  # Copy streams without re-encoding when possible
+                '-movflags', '+faststart',  # Optimize for streaming (web optimization)
+                '-avoid_negative_ts', 'make_zero',  # Fix timing issues
+                output_path
+            ]
+            
+            # Run conversion
+            result = self.cmd_manager.safe_subprocess_run(cmd, capture_output=True, text=True, 
+                                                        timeout=TimeoutConstants.LONG)
+            
+            if result.returncode == 0:
+                # Verify new file is smaller or same size
+                original_size = os.path.getsize(file_path)
+                new_size = os.path.getsize(output_path)
+                
+                # Update database to mark as optimized
+                with self.get_db_context() as conn:
+                    cursor = conn.cursor()
+                    cursor.execute('''UPDATE video_files 
+                                    SET file_path = ?, 
+                                        filename = ?,
+                                        file_size = ?,
+                                        conversion_reason = ?
+                                    WHERE file_path = ?''',
+                                 (output_path, f"{name}.mp4", new_size, 
+                                  f"Optimized {old_ext} to MP4 for streaming", file_path))
+                
+                # Option to remove original (ask user later or make it configurable)
+                return f"Optimized {old_ext} to MP4 ({original_size//(1024*1024)}MB → {new_size//(1024*1024)}MB)"
+            else:
+                # If stream copy fails, try with re-encoding
+                if '-c copy' in ' '.join(cmd):
+                    cmd = [
+                        'ffmpeg',
+                        '-i', file_path,
+                        '-c:v', 'libx264',
+                        '-preset', 'fast',
+                        '-crf', '23',
+                        '-c:a', 'aac',
+                        '-movflags', '+faststart',
+                        output_path
+                    ]
+                    
+                    result = self.cmd_manager.safe_subprocess_run(cmd, capture_output=True, text=True, 
+                                                                timeout=TimeoutConstants.LONG)
+                    
+                    if result.returncode == 0:
+                        original_size = os.path.getsize(file_path)
+                        new_size = os.path.getsize(output_path)
+                        
+                        with self.get_db_context() as conn:
+                            cursor = conn.cursor()
+                            cursor.execute('''UPDATE video_files 
+                                            SET file_path = ?, 
+                                                filename = ?,
+                                                file_size = ?,
+                                                conversion_reason = ?
+                                            WHERE file_path = ?''',
+                                         (output_path, f"{name}.mp4", new_size, 
+                                          f"Re-encoded {old_ext} to MP4 for streaming", file_path))
+                        
+                        return f"Re-encoded {old_ext} to MP4 ({original_size//(1024*1024)}MB → {new_size//(1024*1024)}MB)"
+                
+                return f"Container optimization failed: {result.stderr.strip()}"
+                
+        except subprocess.TimeoutExpired:
+            return "Timeout during container optimization"
+        except (subprocess.SubprocessError, OSError, IOError) as e:
+            return f"Error optimizing container: {self.sanitize_error_message(str(e))}"
 
     def clear_screen(self):
         # Safe screen clearing without os.system()
@@ -1992,7 +2591,559 @@ class MediaManager:
         
     def check_subtitles(self):
         """Check which videos don't have English subtitles."""
-        print("\nChecking for videos without English subtitles...")
+        self.clear_screen()
+        print("="*60)
+        print("📝 Check for Videos Without English Subtitles")
+        print("="*60)
+        
+        # Check for cached subtitle data (configured folders only)
+        sql_condition, params = self.get_folder_sql_conditions()
+        
+        with self.get_db_context() as conn:
+            cursor = conn.cursor()
+            
+            if sql_condition:
+                cursor.execute(f'''
+                    SELECT COUNT(*) FROM video_files 
+                    WHERE has_external_subs = 0 AND has_embedded_subs = 0
+                    AND {sql_condition}
+                ''', params)
+            else:
+                cursor.execute('''
+                    SELECT COUNT(*) FROM video_files 
+                    WHERE has_external_subs = 0 AND has_embedded_subs = 0
+                ''')
+            
+            cached_count = cursor.fetchone()[0]
+            
+            cursor.execute('SELECT MAX(last_scanned) FROM video_files WHERE last_scanned IS NOT NULL')
+            last_scan = cursor.fetchone()[0]
+        
+        if cached_count > 0 and last_scan:
+            scan_age = (time.time() - last_scan) / 3600  # hours
+            print(f"💡 Your recent scan found {cached_count:,} files missing English subtitles")
+            print(f"   (Scan was {scan_age:.1f} hours ago)")
+            print()
+            
+            print("📋 Display Options:")
+            print("1. Show all files missing subtitles")
+            print("2. Show Movies only")
+            print("3. Show TV Shows only")
+            print("4. Show specific TV show")
+            print("5. Save report to file")
+            print("6. Rescan from scratch")
+            print("0. Cancel")
+            
+            choice = self.safe_input("\nEnter your choice: ")
+            
+            if choice == '0':
+                return
+            elif choice == '1':
+                self.display_subtitle_results('All')
+            elif choice == '2':
+                self.display_subtitle_results('Movies')
+            elif choice == '3':
+                self.display_subtitle_results('TV')
+            elif choice == '4':
+                self.pick_tv_show_for_subtitle_check()
+            elif choice == '5':
+                self.save_subtitle_report()
+            elif choice == '6':
+                self.check_subtitles_full_scan()
+            else:
+                print("Invalid choice.")
+                self.safe_input("Press Enter to continue...")
+        else:
+            # No cached data, do full scan
+            print("No recent scan data found. Performing full subtitle check...")
+            self.check_subtitles_full_scan()
+    
+    def display_subtitle_results(self, category):
+        """Display subtitle check results for a specific category."""
+        with self.get_db_context() as conn:
+            cursor = conn.cursor()
+            
+            if category == 'Movies':
+                cursor.execute('''
+                    SELECT file_path FROM video_files 
+                    WHERE has_external_subs = 0 AND has_embedded_subs = 0 
+                    AND file_path LIKE '%/Movies/%'
+                    ORDER BY file_path
+                ''')
+                title = "Movies Without English Subtitles"
+            elif category == 'TV':
+                cursor.execute('''
+                    SELECT file_path FROM video_files 
+                    WHERE has_external_subs = 0 AND has_embedded_subs = 0 
+                    AND file_path LIKE '%/TV/%'
+                    ORDER BY file_path
+                ''')
+                title = "TV Shows Without English Subtitles"
+            else:  # All (Movies and TV only)
+                cursor.execute('''
+                    SELECT file_path FROM video_files 
+                    WHERE has_external_subs = 0 AND has_embedded_subs = 0 
+                    AND (file_path LIKE '%/Movies/%' OR file_path LIKE '%/TV/%')
+                    ORDER BY file_path
+                ''')
+                title = "Movies & TV Shows Without English Subtitles"
+            
+            files = [row[0] for row in cursor.fetchall()]
+        
+        if not files:
+            print(f"✅ No files missing subtitles found in {category}!")
+            self.safe_input("Press Enter to continue...")
+            return
+        
+        print(f"\n{title}")
+        print("="*60)
+        print(f"Found {len(files)} files missing English subtitles:\n")
+        
+        for i, file_path in enumerate(files[:50], 1):  # Show first 50
+            relative_path = os.path.relpath(file_path, self.base_path)
+            print(f"{i:3}. {relative_path}")
+        
+        if len(files) > 50:
+            print(f"\n... and {len(files) - 50} more files")
+        
+        print(f"\n🎯 What would you like to do with these {len(files)} files?")
+        print("1. Download subtitles for all files")
+        print("2. Download subtitles in background mode")
+        print("3. Save list to file")
+        print("4. Go back to main menu")
+        print("0. Cancel")
+        
+        action_choice = self.safe_input("\nEnter your choice: ")
+        
+        if action_choice == '1':
+            # Limit to reasonable batch size
+            batch_files = files[:min(100, len(files))]
+            if len(files) > 100:
+                print(f"Processing first 100 files (out of {len(files)})")
+            self.download_subtitles_from_list(batch_files, background_mode=False)
+        elif action_choice == '2':
+            batch_files = files[:min(100, len(files))]
+            if len(files) > 100:
+                print(f"Processing first 100 files (out of {len(files)})")
+            self.download_subtitles_from_list(batch_files, background_mode=True)
+        elif action_choice == '3':
+            report_file = os.path.join(self.base_path, f"{category.lower()}_missing_subtitles.txt")
+            with open(report_file, "w") as f:
+                f.write(f"{title} - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+                f.write("="*80 + "\n\n")
+                for file_path in files:
+                    relative_path = os.path.relpath(file_path, self.base_path)
+                    f.write(f"{relative_path}\n")
+            print(f"✓ List saved to: {report_file}")
+            self.safe_input("\nPress Enter to continue...")
+        elif action_choice == '4':
+            return
+        elif action_choice != '0':
+            print("Invalid choice.")
+            self.safe_input("Press Enter to continue...")
+    
+    def pick_tv_show_for_subtitle_check(self):
+        """Let user pick a specific TV show to check for subtitles."""
+        while True:
+            self.clear_screen()
+            print("📺 TV Show Navigation")
+            print("="*60)
+            print("1. Browse shows missing subtitles")
+            print("2. Browse all TV shows")
+            print("3. Search for a specific show")
+            print("0. Return to main menu")
+            
+            nav_choice = self.safe_input("\nChoose option: ")
+            
+            if nav_choice == '0':
+                return
+            elif nav_choice == '1':
+                self.browse_shows_missing_subtitles()
+            elif nav_choice == '2':
+                self.browse_all_tv_shows()
+            elif nav_choice == '3':
+                self.search_tv_shows()
+            else:
+                print("Invalid choice.")
+                self.safe_input("Press Enter to continue...")
+    
+    def browse_shows_missing_subtitles(self):
+        """Browse TV shows missing subtitles with pagination."""
+        with self.get_db_context() as conn:
+            cursor = conn.cursor()
+            cursor.execute('''
+                SELECT DISTINCT 
+                    SUBSTR(file_path, 1, INSTR(file_path, '/Season') - 1) as show_path,
+                    COUNT(*) as missing_count
+                FROM video_files 
+                WHERE has_external_subs = 0 AND has_embedded_subs = 0 
+                AND file_path LIKE '%/TV/%'
+                AND file_path LIKE '%/Season%'
+                GROUP BY show_path
+                ORDER BY LOWER(SUBSTR(show_path, INSTR(show_path, '/TV/') + 4))
+            ''')
+            
+            shows = cursor.fetchall()
+        
+        if not shows:
+            print("✅ No TV shows found missing subtitles!")
+            self.safe_input("Press Enter to continue...")
+            return
+        
+        self.paginate_and_select_show(shows, "TV Shows Missing Subtitles")
+    
+    def browse_all_tv_shows(self):
+        """Browse all TV shows with pagination."""
+        with self.get_db_context() as conn:
+            cursor = conn.cursor()
+            cursor.execute('''
+                SELECT DISTINCT 
+                    SUBSTR(file_path, 1, INSTR(file_path, '/Season') - 1) as show_path,
+                    COUNT(*) as total_files,
+                    SUM(CASE WHEN has_external_subs = 0 AND has_embedded_subs = 0 THEN 1 ELSE 0 END) as missing_count
+                FROM video_files 
+                WHERE file_path LIKE '%/TV/%'
+                AND file_path LIKE '%/Season%'
+                GROUP BY show_path
+                ORDER BY LOWER(SUBSTR(show_path, INSTR(show_path, '/TV/') + 4))
+            ''')
+            
+            shows = [(path, missing, total) for path, total, missing in cursor.fetchall()]
+        
+        if not shows:
+            print("No TV shows found in database!")
+            self.safe_input("Press Enter to continue...")
+            return
+        
+        self.paginate_and_select_show(shows, "All TV Shows", show_all=True)
+    
+    def search_tv_shows(self):
+        """Search for TV shows by name."""
+        search_term = self.safe_input("Enter search term: ").strip()
+        if not search_term:
+            return
+        
+        with self.get_db_context() as conn:
+            cursor = conn.cursor()
+            cursor.execute('''
+                SELECT DISTINCT 
+                    SUBSTR(file_path, 1, INSTR(file_path, '/Season') - 1) as show_path,
+                    COUNT(*) as total_files,
+                    SUM(CASE WHEN has_external_subs = 0 AND has_embedded_subs = 0 THEN 1 ELSE 0 END) as missing_count
+                FROM video_files 
+                WHERE file_path LIKE '%/TV/%'
+                AND file_path LIKE '%/Season%'
+                AND LOWER(file_path) LIKE LOWER(?)
+                GROUP BY show_path
+                ORDER BY LOWER(SUBSTR(show_path, INSTR(show_path, '/TV/') + 4))
+            ''', (f"%{search_term}%",))
+            
+            shows = [(path, missing, total) for path, total, missing in cursor.fetchall()]
+        
+        if not shows:
+            print(f"No TV shows found matching '{search_term}'")
+            self.safe_input("Press Enter to continue...")
+            return
+        
+        self.paginate_and_select_show(shows, f"Search Results for '{search_term}'", show_all=True)
+    
+    def paginate_and_select_show(self, shows, title, show_all=False):
+        """Display shows with pagination and handle selection."""
+        page_size = 15
+        current_page = 0
+        total_pages = (len(shows) - 1) // page_size + 1
+        
+        while True:
+            self.clear_screen()
+            print(f"📺 {title}")
+            print("="*60)
+            
+            start_idx = current_page * page_size
+            end_idx = min(start_idx + page_size, len(shows))
+            page_shows = shows[start_idx:end_idx]
+            
+            print(f"Page {current_page + 1} of {total_pages} (Showing {start_idx + 1}-{end_idx} of {len(shows)} shows)\n")
+            
+            for i, show_data in enumerate(page_shows, 1):
+                show_path = show_data[0]
+                show_name = os.path.basename(show_path)
+                
+                if show_all and len(show_data) == 3:
+                    missing_count, total_files = show_data[1], show_data[2]
+                    if missing_count > 0:
+                        print(f"{i:2}. {show_name} ({missing_count}/{total_files} missing subtitles)")
+                    else:
+                        print(f"{i:2}. {show_name} (all {total_files} have subtitles)")
+                else:
+                    missing_count = show_data[1]
+                    print(f"{i:2}. {show_name} ({missing_count} missing)")
+            
+            print("\nNavigation:")
+            if current_page > 0:
+                print("p. Previous page")
+            if current_page < total_pages - 1:
+                print("n. Next page")
+            print("s. Search again")
+            print("0. Go back")
+            
+            choice = self.safe_input(f"\nSelect show (1-{len(page_shows)}) or navigation option: ").strip().lower()
+            
+            if choice == '0':
+                return
+            elif choice == 'p' and current_page > 0:
+                current_page -= 1
+            elif choice == 'n' and current_page < total_pages - 1:
+                current_page += 1
+            elif choice == 's':
+                self.search_tv_shows()
+                return
+            else:
+                try:
+                    show_choice = int(choice)
+                    if 1 <= show_choice <= len(page_shows):
+                        selected_show = page_shows[show_choice - 1][0]
+                        self.show_subtitle_details(selected_show)
+                        return
+                    else:
+                        print("Invalid selection.")
+                        self.safe_input("Press Enter to continue...")
+                except ValueError:
+                    print("Invalid selection.")
+                    self.safe_input("Press Enter to continue...")
+    
+    def show_subtitle_details(self, show_path):
+        """Show subtitle details and actions for a specific show."""
+        show_name = os.path.basename(show_path)
+        
+        # Get files for this show
+        with self.get_db_context() as conn:
+            cursor = conn.cursor()
+            cursor.execute('''
+                SELECT file_path, has_external_subs, has_embedded_subs FROM video_files 
+                WHERE file_path LIKE ?
+                ORDER BY file_path
+            ''', (f"{show_path}%",))
+            
+            all_files = cursor.fetchall()
+        
+        if not all_files:
+            print(f"No files found for {show_name}")
+            self.safe_input("Press Enter to continue...")
+            return
+        
+        missing_files = [f[0] for f in all_files if f[1] == 0 and f[2] == 0]
+        
+        self.clear_screen()
+        print(f"📺 {show_name}")
+        print("="*60)
+        print(f"Total files: {len(all_files)}")
+        print(f"Missing subtitles: {len(missing_files)}")
+        print(f"Have subtitles: {len(all_files) - len(missing_files)}")
+        
+        if missing_files:
+            print(f"\nFiles missing subtitles:")
+            for i, file_path in enumerate(missing_files[:10], 1):
+                filename = os.path.basename(file_path)
+                print(f"  {i:2}. {filename}")
+            
+            if len(missing_files) > 10:
+                print(f"  ... and {len(missing_files) - 10} more files")
+        
+        print(f"\n🎯 What would you like to do?")
+        print("1. Download subtitles for missing files")
+        print("2. Download subtitles in background mode")
+        print("3. Force redownload subtitles (overwrite existing)")
+        print("4. Rescan this show for subtitle status")
+        print("5. Save missing list to file")
+        print("6. Show all files (with subtitle status)")
+        print("0. Go back")
+        
+        action_choice = self.safe_input("\nEnter your choice: ")
+        
+        if action_choice == '1':
+            if missing_files:
+                self.download_subtitles_from_list(missing_files, background_mode=False)
+            else:
+                print("No files missing subtitles!")
+                self.safe_input("Press Enter to continue...")
+        elif action_choice == '2':
+            if missing_files:
+                self.download_subtitles_from_list(missing_files, background_mode=True)
+            else:
+                print("No files missing subtitles!")
+                self.safe_input("Press Enter to continue...")
+        elif action_choice == '3':
+            self.force_redownload_subtitles_for_show(show_path, show_name)
+        elif action_choice == '4':
+            self.rescan_show_subtitles(show_path, show_name)
+        elif action_choice == '5':
+            if missing_files:
+                report_file = os.path.join(self.base_path, f"{show_name.replace(' ', '_')}_missing_subtitles.txt")
+                with open(report_file, "w") as f:
+                    f.write(f"{show_name} - Missing Subtitles - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+                    f.write("="*80 + "\n\n")
+                    for file_path in missing_files:
+                        relative_path = os.path.relpath(file_path, self.base_path)
+                        f.write(f"{relative_path}\n")
+                print(f"✓ List saved to: {report_file}")
+                self.safe_input("\nPress Enter to continue...")
+            else:
+                print("No missing files to save!")
+                self.safe_input("Press Enter to continue...")
+        elif action_choice == '6':
+            self.show_all_files_with_status(show_name, all_files)
+        elif action_choice != '0':
+            print("Invalid choice.")
+            self.safe_input("Press Enter to continue...")
+    
+    def show_all_files_with_status(self, show_name, all_files):
+        """Show all files in a show with their subtitle status."""
+        self.clear_screen()
+        print(f"📺 {show_name} - All Files")
+        print("="*60)
+        
+        for i, (file_path, has_external, has_embedded) in enumerate(all_files, 1):
+            filename = os.path.basename(file_path)
+            
+            if has_external and has_embedded:
+                status = "✓ External + Embedded"
+            elif has_external:
+                status = "✓ External subs"
+            elif has_embedded:
+                status = "✓ Embedded subs"
+            else:
+                status = "❌ No subtitles"
+            
+            print(f"{i:3}. {filename:<50} {status}")
+        
+        self.safe_input("\nPress Enter to continue...")
+    
+    def force_redownload_subtitles_for_show(self, show_path, show_name):
+        """Force redownload subtitles for all files in a show (overwrite existing)."""
+        print(f"\n🔄 Force Redownload Subtitles for {show_name}")
+        print("="*60)
+        print("This will download subtitles for ALL episodes, even if they already exist.")
+        
+        confirm = self.safe_input("Are you sure? (y/N): ")
+        if confirm.lower() != 'y':
+            return
+        
+        # Get all files for this show (not just missing subtitles)
+        with self.get_db_context() as conn:
+            cursor = conn.cursor()
+            cursor.execute('''
+                SELECT file_path FROM video_files 
+                WHERE file_path LIKE ?
+                ORDER BY file_path
+            ''', (f"{show_path}%",))
+            
+            all_files = [row[0] for row in cursor.fetchall()]
+        
+        if not all_files:
+            print("No files found for this show")
+            self.safe_input("Press Enter to continue...")
+            return
+        
+        print(f"🎬 Processing Mode for {len(all_files)} files:")
+        print("1. Watch progress (interactive)")
+        print("2. Run in background (faster)")
+        
+        mode_choice = self.safe_input("\nChoose processing mode: ")
+        background_mode = (mode_choice == '2')
+        
+        # Force download for all files
+        self.download_subtitles_from_list(all_files, background_mode, force_download=True)
+    
+    def rescan_show_subtitles(self, show_path, show_name):
+        """Rescan a specific show to update subtitle status in database."""
+        print(f"\n🔍 Rescanning {show_name} for Subtitle Status")
+        print("="*60)
+        
+        # Get all files for this show
+        show_files = []
+        for root, dirs, files in os.walk(show_path, followlinks=False):
+            for file in files:
+                if file.lower().endswith(self.video_extensions):
+                    file_path = os.path.join(root, file)
+                    show_files.append(file_path)
+        
+        if not show_files:
+            print("No video files found in this show directory")
+            self.safe_input("Press Enter to continue...")
+            return
+        
+        print(f"Rescanning {len(show_files)} files...")
+        self.operation_log("rescan_show", "STARTED", details=f"Show: {show_name}, Files: {len(show_files)}")
+        
+        updated_count = 0
+        for i, file_path in enumerate(show_files, 1):
+            print(f"Checking {i}/{len(show_files)}: {os.path.basename(file_path)}", end='\r')
+            
+            # Check for external subtitle files
+            base_name = os.path.splitext(file_path)[0]
+            has_external_subs = any(os.path.exists(f"{base_name}{ext}") for ext in ['.srt', '.en.srt', '.eng.srt', '.vtt', '.en.vtt'])
+            
+            # Check for embedded subtitles
+            has_embedded_subs = False
+            info = self.get_video_info(file_path)
+            if info:
+                for stream in info.get('streams', []):
+                    if stream.get('codec_type') == 'subtitle':
+                        language = stream.get('tags', {}).get('language', '')
+                        if language in ['eng', 'en']:
+                            has_embedded_subs = True
+                            break
+            
+            # Update database
+            with self.get_db_context() as conn:
+                cursor = conn.cursor()
+                cursor.execute('''
+                    UPDATE video_files 
+                    SET has_external_subs = ?, has_embedded_subs = ?, last_scanned = ?
+                    WHERE file_path = ?
+                ''', (has_external_subs, has_embedded_subs, time.time(), file_path))
+                
+                if cursor.rowcount > 0:
+                    updated_count += 1
+        
+        print(f"\n✓ Rescan complete for {show_name}")
+        print(f"   Updated {updated_count} files in database")
+        
+        self.operation_log("rescan_show", "SUCCESS", details=f"Show: {show_name}, Updated: {updated_count}/{len(show_files)}")
+        self.safe_input("\nPress Enter to continue...")
+    
+    def save_subtitle_report(self):
+        """Save subtitle check results to file."""
+        with self.get_db_context() as conn:
+            cursor = conn.cursor()
+            cursor.execute('''
+                SELECT file_path FROM video_files 
+                WHERE has_external_subs = 0 AND has_embedded_subs = 0 
+                ORDER BY file_path
+            ''')
+            files = [row[0] for row in cursor.fetchall()]
+        
+        if not files:
+            print("✅ No files missing subtitles found!")
+            self.safe_input("Press Enter to continue...")
+            return
+        
+        report_file = os.path.join(self.base_path, "videos_without_subtitles.txt")
+        with open(report_file, "w") as f:
+            f.write(f"Videos Without English Subtitles - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+            f.write("="*80 + "\n\n")
+            
+            for file_path in files:
+                relative_path = os.path.relpath(file_path, self.base_path)
+                f.write(f"{relative_path}\n")
+        
+        print(f"✓ Report saved: {report_file}")
+        print(f"   {len(files):,} files missing English subtitles")
+        self.safe_input("\nPress Enter to continue...")
+    
+    def check_subtitles_full_scan(self):
+        """Perform full filesystem scan for subtitle check (legacy method)."""
+        print("\nPerforming full subtitle check (this may take a while)...")
         
         videos_without_subs = []
         videos_checked = 0
@@ -2044,14 +3195,21 @@ class MediaManager:
         print(f"\n\nChecked {videos_checked} videos")
         print(f"Found {len(videos_without_subs)} videos without English subtitles:\n")
         
+        # Show first 50 results
+        for video in sorted(videos_without_subs[:50], key=lambda x: x['relative_path']):
+            print(f"  {video['name']}")
+        
+        if len(videos_without_subs) > 50:
+            print(f"\n... and {len(videos_without_subs) - 50} more files")
+        
         # Save to file
-        with open(os.path.join(self.base_path, "videos_without_subtitles.txt"), "w") as f:
+        report_file = os.path.join(self.base_path, "videos_without_subtitles.txt")
+        with open(report_file, "w") as f:
             f.write(f"Videos Without English Subtitles - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
             f.write("="*80 + "\n\n")
             
             for video in sorted(videos_without_subs, key=lambda x: x['relative_path']):
                 f.write(f"{video['relative_path']}\n")
-                print(f"  {video['name']}")
         
         print(f"\nFull list saved to: videos_without_subtitles.txt")
         
@@ -2511,10 +3669,14 @@ class MediaManager:
             self.safe_input("\nPress Enter to continue...")
             return
         
-        # Check for cached subtitle data
+        # Check for cached subtitle data (Movies and TV only)
         with self.get_db_context() as conn:
             cursor = conn.cursor()
-            cursor.execute('SELECT COUNT(*) FROM video_files WHERE has_external_subs = 0 AND has_embedded_subs = 0')
+            cursor.execute('''
+                SELECT COUNT(*) FROM video_files 
+                WHERE has_external_subs = 0 AND has_embedded_subs = 0
+                AND (file_path LIKE '%/Movies/%' OR file_path LIKE '%/TV/%')
+            ''')
             cached_count = cursor.fetchone()[0]
             
             cursor.execute('SELECT MAX(last_scanned) FROM video_files WHERE last_scanned IS NOT NULL')
@@ -2709,23 +3871,42 @@ class MediaManager:
         
         self.safe_input("\nPress Enter to continue...")
         
-    def download_subtitle_for_file(self, video_path, quiet=False):
+    def download_subtitle_for_file(self, video_path, quiet=False, force_download=False):
         """Download subtitle for a single video file using subliminal."""
+        filename = os.path.basename(video_path)
+        
         try:
-            # Use subliminal command line tool
+            # Log start of operation
+            operation_type = "subtitle_force_download" if force_download else "subtitle_download"
+            self.operation_log(operation_type, "STARTED", file_path=video_path)
+            
+            # Use subliminal command line tool with reliable providers only
             cmd = [
                 sys.executable, "-m", "subliminal",
                 "download",
                 "-l", "en",  # English only
-                "-p", "opensubtitles", "podnapisi", "tvsubtitles", "thesubdb",  # providers
-                video_path
+                "-p", "opensubtitles", "podnapisi",  # Use only reliable providers
+                "-v",  # Verbose output for better debugging
             ]
             
+            # Add force flag if needed
+            if force_download:
+                cmd.append("-f")  # Force download even if subtitle exists
+            
+            cmd.append(video_path)
+            
             if not quiet:
-                print(f"     File: {os.path.basename(video_path)}")
+                print(f"     File: {filename}")
                 print(f"     Searching providers...")
             
-            result = self.cmd_manager.safe_subprocess_run(cmd, capture_output=True, text=True, timeout=TimeoutConstants.STANDARD)
+            result = self.cmd_manager.safe_subprocess_run(cmd, capture_output=True, text=True, timeout=TimeoutConstants.MEDIUM)
+            
+            # Log the full command output for debugging (only if not quiet)
+            if not quiet:
+                if result.stdout:
+                    self.operation_log("subtitle_download", "OUTPUT", details=f"stdout: {result.stdout[:500]}", file_path=video_path)
+                if result.stderr:
+                    self.operation_log("subtitle_download", "STDERR", details=f"stderr: {result.stderr[:500]}", file_path=video_path)
             
             # Show subliminal output if there's an error or in verbose mode
             if not quiet and result.stderr:
@@ -2734,56 +3915,159 @@ class MediaManager:
             if result.returncode == 0:
                 # Check if subtitle was downloaded
                 base_name = os.path.splitext(video_path)[0]
-                if any(os.path.exists(f"{base_name}{ext}") for ext in ['.srt', '.en.srt']):
+                subtitle_found = any(os.path.exists(f"{base_name}{ext}") for ext in ['.srt', '.en.srt'])
+                
+                if subtitle_found:
                     if not quiet:
+                        self.operation_log("subtitle_download", "SUCCESS", details="Subtitle file created", file_path=video_path)
                         print("✓ Subtitle downloaded successfully!")
                     return True
                 else:
                     if not quiet:
+                        self.operation_log("subtitle_download", "NO_SUBTITLE", details="No subtitle found by providers", file_path=video_path)
                         print("✗ No subtitle found for this video")
                     return False
             else:
                 if not quiet:
-                    print(f"✗ Error downloading subtitle: {result.stderr}")
+                    self.operation_log("subtitle_download", "FAILED", details=f"Return code: {result.returncode}, Error: {result.stderr[:200]}", file_path=video_path)
+                    print(f"✗ Error downloading subtitle (code {result.returncode})")
                 return False
                 
         except (subprocess.SubprocessError, OSError, IOError) as e:
+            error_msg = str(e)
             if not quiet:
-                print(f"✗ Error: {self.sanitize_error_message(str(e))}")
+                self.operation_log("subtitle_download", "EXCEPTION", details=error_msg, file_path=video_path)
+                print(f"✗ Error: {self.sanitize_error_message(error_msg)}")
             return False
     
-    def download_subtitles_from_list(self, file_list, background_mode=False):
-        """Download subtitles from a specific list of files with progress tracking."""
+    def download_subtitles_from_list(self, file_list, background_mode=False, force_download=False):
+        """Download subtitles from a specific list of files with concurrent processing."""
         total_files = len(file_list)
+        action_type = "force redownload" if force_download else "download"
+        
+        print(f"\n🎬 Processing {total_files} files for subtitle {action_type}...")
+        print(f"Using parallel processing ({self.max_parallel_downloads} concurrent downloads)")
+        
+        # Filter out files that already have subtitles (unless forcing)
+        files_to_process = []
+        skipped = 0
+        
+        if not force_download:
+            for file_path in file_list:
+                base_name = os.path.splitext(file_path)[0]
+                has_existing = any(os.path.exists(f"{base_name}{ext}") for ext in ['.srt', '.en.srt', '.eng.srt'])
+                if has_existing:
+                    skipped += 1
+                else:
+                    files_to_process.append(file_path)
+        else:
+            files_to_process = file_list
+        
+        if skipped > 0:
+            print(f"Skipping {skipped} files that already have subtitles")
+        
+        if not files_to_process:
+            print("✓ All files already have subtitles!")
+            self.safe_input("\nPress Enter to continue...")
+            return
+        
+        print(f"Processing {len(files_to_process)} files...")
+        
+        # Progress tracking
+        completed = 0
         successful = 0
         failed = 0
+        failed_files = []
+        current_file = ""
         
-        print(f"\n🎬 Processing {total_files} files for subtitle download...")
+        # Thread-safe progress update
+        progress_lock = threading.Lock()
         
-        if background_mode:
-            print("Running in background mode...")
-        
-        for i, file_path in enumerate(file_list, 1):
-            if not background_mode:
-                print(f"\n[{i}/{total_files}] Processing:")
+        def update_progress():
+            while completed < len(files_to_process):
+                with progress_lock:
+                    current = completed
+                    success_count = successful
+                    fail_count = failed
+                    current_filename = current_file
                 
-            success = self.download_subtitle_for_file(file_path, quiet=background_mode)
+                # Simple progress bar with completed/remaining counts
+                if len(files_to_process) > 0:
+                    pct = (current / len(files_to_process)) * 100
+                    filled = int(pct / 2)
+                    bar = "█" * filled + "░" * (50 - filled)
+                    remaining = len(files_to_process) - current
+                    
+                    # Clear the line and print progress
+                    print(f"\r\033[K[{bar}] {pct:5.1f}% - Completed: {current}, Remaining: {remaining} ✓{success_count} ✗{fail_count}", end='', flush=True)
+                
+                time.sleep(0.5)
             
-            if success:
-                successful += 1
-                # Update database
-                with self.get_db_context() as conn:
-                    cursor = conn.cursor()
-                    cursor.execute('UPDATE video_files SET has_external_subs = 1 WHERE file_path = ?', (file_path,))
-            else:
-                failed += 1
-            
-            if background_mode and i % 10 == 0:
-                print(f"Progress: {i}/{total_files} ({successful} successful, {failed} failed)")
+            # Final progress bar
+            print(f"\r\033[K[{'█' * 50}] 100.0% - Completed: {len(files_to_process)}, Remaining: 0 ✓{successful} ✗{failed}")
         
-        print(f"\n✓ Subtitle download complete!")
+        def download_worker(file_path):
+            nonlocal completed, successful, failed, failed_files, current_file
+            
+            try:
+                # Update current file being processed
+                with progress_lock:
+                    current_file = file_path
+                
+                result = self.download_subtitle_for_file(file_path, quiet=True, force_download=force_download)
+                
+                with progress_lock:
+                    completed += 1
+                    if result:
+                        successful += 1
+                        # Update database
+                        with self.get_db_context() as conn:
+                            cursor = conn.cursor()
+                            cursor.execute('UPDATE video_files SET has_external_subs = 1 WHERE file_path = ?', (file_path,))
+                    else:
+                        failed += 1
+                        failed_files.append(file_path)
+                        
+            except Exception as e:
+                with progress_lock:
+                    completed += 1
+                    failed += 1
+                    failed_files.append(file_path)
+                    self.operation_log("subtitle_download", "WORKER_EXCEPTION", details=str(e), file_path=file_path)
+        
+        # Start progress display thread
+        if not background_mode:
+            progress_thread = threading.Thread(target=update_progress, daemon=True)
+            progress_thread.start()
+        
+        # Use ThreadPoolExecutor for concurrent downloads
+        max_workers = self.max_parallel_downloads
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            # Submit all download tasks
+            futures = [executor.submit(download_worker, file_path) for file_path in files_to_process]
+            
+            # Wait for all to complete
+            for future in as_completed(futures):
+                try:
+                    future.result()  # Get result to catch any exceptions
+                except Exception as e:
+                    self.operation_log("subtitle_download", "FUTURE_EXCEPTION", details=str(e))
+        
+        print(f"\n\n✓ Subtitle download complete!")
         print(f"   Successful: {successful}")
         print(f"   Failed: {failed}")
+        if skipped > 0:
+            print(f"   Skipped: {skipped} (already had subtitles)")
+        
+        # Show failed files if any
+        if failed_files:
+            print(f"\n❌ Failed Downloads ({len(failed_files)} files):")
+            for file_path in failed_files[:10]:  # Show first 10
+                filename = os.path.basename(file_path)
+                print(f"   • {filename}")
+            
+            if len(failed_files) > 10:
+                print(f"   ... and {len(failed_files) - 10} more")
         
         self.safe_input("\nPress Enter to continue...")
     
@@ -3765,6 +5049,266 @@ class MediaManager:
         
         print(f"\nFull report saved to: {report_filename}")
         self.safe_input("\nPress Enter to continue...")
+    
+    def show_organization_status(self):
+        """Show cached organization statistics from database."""
+        try:
+            with self.get_db_context() as conn:
+                cursor = conn.cursor()
+                
+                # Check if we have cached data
+                cursor.execute('SELECT COUNT(*) FROM video_files')
+                total_files = cursor.fetchone()[0]
+                
+                if total_files == 0:
+                    print("💡 No cached data found. Run Background Analysis first (Option 1)")
+                    print()
+                    return
+                
+                # Get last scan time
+                cursor.execute('SELECT MAX(last_scanned) FROM video_files WHERE last_scanned IS NOT NULL')
+                last_scan = cursor.fetchone()[0]
+                
+                if last_scan:
+                    scan_age = (time.time() - last_scan) / 3600  # hours
+                    if scan_age > 24:
+                        print(f"⚠️  Data is {scan_age:.1f} hours old - consider running fresh analysis")
+                    else:
+                        print(f"📊 Using cached data from {scan_age:.1f} hours ago")
+                
+                # Quick analysis for organization issues
+                import re
+                movie_pattern = r'^(.+?)\s*\((\d{4})\)'
+                tv_pattern = r'^(.+?)\s*-?\s*[Ss](\d+)[Ee](\d+)'
+                
+                # Count movies needing renaming
+                cursor.execute("SELECT file_path FROM video_files WHERE file_path LIKE '%/Movies/%'")
+                movie_files = cursor.fetchall()
+                non_compliant_movies = 0
+                for (file_path,) in movie_files:
+                    filename = os.path.basename(file_path)
+                    if not re.match(movie_pattern, filename):
+                        non_compliant_movies += 1
+                
+                # Count TV episodes needing renaming
+                cursor.execute("SELECT file_path FROM video_files WHERE file_path LIKE '%/TV/%'")
+                tv_files = cursor.fetchall()
+                non_compliant_tv = 0
+                for (file_path,) in tv_files:
+                    filename = os.path.basename(file_path)
+                    if not re.search(tv_pattern, filename):
+                        non_compliant_tv += 1
+                
+                # Count files in wrong locations (not in proper folders)
+                cursor.execute("SELECT COUNT(*) FROM video_files WHERE file_path NOT LIKE '%/Movies/%' AND file_path NOT LIKE '%/TV/%' AND file_path NOT LIKE '%/Kids Movies/%' AND file_path NOT LIKE '%/Christmas/%' AND file_path NOT LIKE '%/Music Videos/%' AND file_path NOT LIKE '%/Personal/%'")
+                misplaced_files = cursor.fetchone()[0]
+                
+                print("📋 Organization Status:")
+                print(f"   Movies needing rename: {non_compliant_movies:,}")
+                print(f"   TV episodes needing rename: {non_compliant_tv:,}")
+                print(f"   Files in wrong folders: {misplaced_files:,}")
+                
+                # Show priority items
+                if non_compliant_movies > 0 or non_compliant_tv > 0 or misplaced_files > 0:
+                    print("💡 Issues found - use options below to fix them")
+                else:
+                    print("✅ Library appears well-organized!")
+                print()
+                
+        except Exception as e:
+            print("⚠️  Could not analyze organization status")
+            print()
+    
+    def configure_folders(self):
+        """Configure which folders to scan and their types."""
+        self.clear_screen()
+        print("📁 Folder Configuration")
+        print("="*60)
+        
+        with self.get_db_context() as conn:
+            cursor = conn.cursor()
+            cursor.execute('SELECT folder_path, folder_type, enabled FROM folder_config ORDER BY folder_type, folder_path')
+            current_folders = cursor.fetchall()
+        
+        if current_folders:
+            print("Current configured folders:")
+            for folder_path, folder_type, enabled in current_folders:
+                status = "✓" if enabled else "✗"
+                print(f"  {status} {folder_path} ({folder_type})")
+            print()
+        
+        print("Options:")
+        print("1. Add new folder")
+        print("2. Remove folder")
+        print("3. Enable/disable folder")
+        print("4. Reset to default (Movies & TV)")
+        print("0. Done")
+        
+        while True:
+            choice = self.safe_input("\nEnter your choice: ")
+            
+            if choice == '0':
+                break
+            elif choice == '1':
+                self.add_scan_folder()
+            elif choice == '2':
+                self.remove_scan_folder()
+            elif choice == '3':
+                self.toggle_scan_folder()
+            elif choice == '4':
+                self.reset_default_folders()
+            else:
+                print("Invalid choice.")
+    
+    def add_scan_folder(self):
+        """Add a new folder to scan."""
+        print("\nAvailable folders in", self.base_path + ":")
+        subdirs = []
+        for item in os.listdir(self.base_path):
+            item_path = os.path.join(self.base_path, item)
+            if os.path.isdir(item_path) and not item.startswith('.'):
+                subdirs.append(item)
+        
+        for i, subdir in enumerate(subdirs, 1):
+            print(f"  {i}. {subdir}")
+        
+        try:
+            dir_choice = int(self.safe_input("\nSelect folder number (0 to cancel): "))
+            if dir_choice == 0:
+                return
+            if 1 <= dir_choice <= len(subdirs):
+                selected_dir = subdirs[dir_choice - 1]
+                folder_path = os.path.join(self.base_path, selected_dir)
+                
+                print(f"\nSelected: {selected_dir}")
+                print("What type of content is in this folder?")
+                print("1. Movies")
+                print("2. TV Shows")
+                
+                type_choice = self.safe_input("\nEnter type (1 or 2): ")
+                folder_type = 'movies' if type_choice == '1' else 'tv' if type_choice == '2' else None
+                
+                if folder_type:
+                    with self.get_db_context() as conn:
+                        cursor = conn.cursor()
+                        cursor.execute('''
+                            INSERT OR REPLACE INTO folder_config (folder_path, folder_type, last_updated)
+                            VALUES (?, ?, ?)
+                        ''', (folder_path, folder_type, time.time()))
+                    print(f"✓ Added {selected_dir} as {folder_type} folder")
+                else:
+                    print("Invalid type selection")
+        except (ValueError, IndexError):
+            print("Invalid selection")
+    
+    def remove_scan_folder(self):
+        """Remove a folder from scanning."""
+        with self.get_db_context() as conn:
+            cursor = conn.cursor()
+            cursor.execute('SELECT id, folder_path, folder_type FROM folder_config WHERE enabled = 1')
+            folders = cursor.fetchall()
+        
+        if not folders:
+            print("No folders to remove")
+            return
+        
+        print("\nCurrent folders:")
+        for i, (folder_id, folder_path, folder_type) in enumerate(folders, 1):
+            folder_name = os.path.basename(folder_path)
+            print(f"  {i}. {folder_name} ({folder_type})")
+        
+        try:
+            choice = int(self.safe_input("\nSelect folder to remove (0 to cancel): "))
+            if choice == 0:
+                return
+            if 1 <= choice <= len(folders):
+                folder_id = folders[choice - 1][0]
+                with self.get_db_context() as conn:
+                    cursor = conn.cursor()
+                    cursor.execute('DELETE FROM folder_config WHERE id = ?', (folder_id,))
+                print("✓ Folder removed")
+        except ValueError:
+            print("Invalid selection")
+    
+    def toggle_scan_folder(self):
+        """Enable or disable a folder."""
+        with self.get_db_context() as conn:
+            cursor = conn.cursor()
+            cursor.execute('SELECT id, folder_path, folder_type, enabled FROM folder_config')
+            folders = cursor.fetchall()
+        
+        if not folders:
+            print("No folders configured")
+            return
+        
+        print("\nConfigured folders:")
+        for i, (folder_id, folder_path, folder_type, enabled) in enumerate(folders, 1):
+            status = "✓ Enabled" if enabled else "✗ Disabled"
+            folder_name = os.path.basename(folder_path)
+            print(f"  {i}. {folder_name} ({folder_type}) - {status}")
+        
+        try:
+            choice = int(self.safe_input("\nSelect folder to toggle (0 to cancel): "))
+            if choice == 0:
+                return
+            if 1 <= choice <= len(folders):
+                folder_id, _, _, enabled = folders[choice - 1]
+                new_status = 0 if enabled else 1
+                with self.get_db_context() as conn:
+                    cursor = conn.cursor()
+                    cursor.execute('UPDATE folder_config SET enabled = ? WHERE id = ?', (new_status, folder_id))
+                print(f"✓ Folder {'enabled' if new_status else 'disabled'}")
+        except ValueError:
+            print("Invalid selection")
+    
+    def reset_default_folders(self):
+        """Reset to default Movies and TV folders."""
+        confirm = self.safe_input("Reset to default folders (Movies & TV)? (y/N): ")
+        if confirm.lower() != 'y':
+            return
+        
+        with self.get_db_context() as conn:
+            cursor = conn.cursor()
+            cursor.execute('DELETE FROM folder_config')
+            
+            default_folders = [
+                (os.path.join(self.base_path, 'Movies'), 'movies'),
+                (os.path.join(self.base_path, 'TV'), 'tv')
+            ]
+            
+            for folder_path, folder_type in default_folders:
+                if os.path.exists(folder_path):
+                    cursor.execute('''
+                        INSERT INTO folder_config (folder_path, folder_type, last_updated)
+                        VALUES (?, ?, ?)
+                    ''', (folder_path, folder_type, time.time()))
+        
+        print("✓ Reset to default folders")
+    
+    def get_folder_sql_conditions(self, folder_type=None):
+        """Get SQL conditions for configured folders."""
+        with self.get_db_context() as conn:
+            cursor = conn.cursor()
+            
+            if folder_type:
+                cursor.execute('SELECT folder_path FROM folder_config WHERE enabled = 1 AND folder_type = ?', (folder_type,))
+            else:
+                cursor.execute('SELECT folder_path FROM folder_config WHERE enabled = 1')
+            
+            folders = [row[0] for row in cursor.fetchall()]
+        
+        if not folders:
+            return None, []
+        
+        # Build SQL condition
+        conditions = []
+        params = []
+        for folder in folders:
+            conditions.append("file_path LIKE ?")
+            params.append(f"{folder}%")
+        
+        sql_condition = f"({' OR '.join(conditions)})"
+        return sql_condition, params
         
     def smart_organization(self):
         """Smart organization menu for Plex compatibility."""
@@ -3773,6 +5317,10 @@ class MediaManager:
             print("="*60)
             print("📂 Smart Organization")
             print("="*60)
+            
+            # Show cached statistics if available
+            self.show_organization_status()
+            
             print("1. Check Plex naming compliance")
             print("2. Auto-rename movies to Plex format")
             print("3. Auto-rename TV shows to Plex format")
@@ -3958,17 +5506,32 @@ class MediaManager:
         
     def auto_rename_tv_shows(self):
         """Auto-rename TV shows to Plex format: Show Name - S##E## - Episode Title.ext"""
-        print("\nAuto-rename TV shows to Plex format...")
+        self.clear_screen()
+        print("📺 Auto-rename TV Shows to Plex Format")
+        print("="*60)
         
-        import re
+        # Check for cached data first
+        with self.get_db_context() as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT COUNT(*) FROM video_files WHERE file_path LIKE '%/TV/%'")
+            cached_tv_count = cursor.fetchone()[0]
+            
+            cursor.execute('SELECT MAX(last_scanned) FROM video_files WHERE last_scanned IS NOT NULL')
+            last_scan = cursor.fetchone()[0]
         
-        tv_path = os.path.join(self.base_path, "TV")
-        if not os.path.exists(tv_path):
-            print("TV directory not found!")
+        if cached_tv_count == 0:
+            print("💡 No TV shows found in cached data. Run Background Analysis first (Option 1)")
             self.safe_input("\nPress Enter to continue...")
             return
         
-        rename_candidates = []
+        if last_scan:
+            scan_age = (time.time() - last_scan) / 3600
+            print(f"📊 Using cached data from {scan_age:.1f} hours ago")
+            print(f"   Found {cached_tv_count:,} TV episodes in database")
+        
+        print("\n🔍 Analyzing TV show naming from cached data...")
+        
+        import re
         
         # Patterns to extract season and episode
         patterns = [
@@ -3977,35 +5540,52 @@ class MediaManager:
             (r'Season\s*(\d+).*Episode\s*(\d+)', 'S{:02d}E{:02d}'),  # Season 1 Episode 1
         ]
         
-        for show_dir in os.listdir(tv_path):
-            show_path = os.path.join(tv_path, show_dir)
-            if os.path.isdir(show_path):
-                for root, dirs, files in os.walk(show_path, followlinks=False):
-                    for file in files:
-                        if file.lower().endswith(self.video_extensions):
-                            file_path = os.path.join(root, file)
-                            
-                            # Try to extract season and episode
-                            new_name = None
-                            for pattern, format_str in patterns:
-                                match = re.search(pattern, file, re.IGNORECASE)
-                                if match:
-                                    try:
-                                        season = int(match.group(1))
-                                        episode = int(match.group(2))
-                                    except (ValueError, IndexError):
-                                        continue
-                                    
-                                    # Create new name
-                                    ext = os.path.splitext(file)[1]
-                                    episode_str = format_str.format(season, episode)
-                                    new_name = f"{show_dir} - {episode_str}{ext}"
-                                    break
-                            
-                            if new_name and new_name != file:
-                                new_path = os.path.join(root, new_name)
-                                if not os.path.exists(new_path):
-                                    rename_candidates.append((file_path, new_path, file, new_name, show_dir))
+        rename_candidates = []
+        
+        # Get TV files from database
+        with self.get_db_context() as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT file_path FROM video_files WHERE file_path LIKE '%/TV/%'")
+            tv_files = cursor.fetchall()
+        
+        print(f"Checking {len(tv_files)} TV episodes for Plex naming compliance...")
+        
+        for i, (file_path,) in enumerate(tv_files, 1):
+            # Show progress every 50 files or at completion
+            if i % 50 == 0 or i == len(tv_files):
+                print(f"\rChecking {i} out of {len(tv_files)}...", end='', flush=True)
+            filename = os.path.basename(file_path)
+            directory = os.path.dirname(file_path)
+            
+            # Extract show name from path
+            tv_parts = file_path.split('/TV/')
+            if len(tv_parts) > 1:
+                show_path_part = tv_parts[1]
+                show_dir = show_path_part.split('/')[0]
+                
+                # Try to extract season and episode
+                new_name = None
+                for pattern, format_str in patterns:
+                    match = re.search(pattern, filename, re.IGNORECASE)
+                    if match:
+                        try:
+                            season = int(match.group(1))
+                            episode = int(match.group(2))
+                        except (ValueError, IndexError):
+                            continue
+                        
+                        # Create new name
+                        ext = os.path.splitext(filename)[1]
+                        episode_str = format_str.format(season, episode)
+                        new_name = f"{show_dir} - {episode_str}{ext}"
+                        break
+                
+                if new_name and new_name != filename:
+                    new_path = os.path.join(directory, new_name)
+                    if not os.path.exists(new_path):
+                        rename_candidates.append((file_path, new_path, filename, new_name, show_dir))
+        
+        print(f"\rChecking {len(tv_files)} out of {len(tv_files)}... Complete!")
         
         if not rename_candidates:
             print("No TV episodes need renaming!")
@@ -4030,14 +5610,75 @@ class MediaManager:
         
         response = self.safe_input("\nRename these episodes? (y/N): ")
         if response.lower() == 'y':
-            renamed = 0
-            for old_path, new_path, _, _, _ in rename_candidates:
+            renamed_videos = 0
+            renamed_subtitles = 0
+            total_to_rename = len(rename_candidates)
+            
+            print(f"\n🔄 Renaming {total_to_rename} episodes...")
+            
+            for i, (old_path, new_path, old_name, new_name, _) in enumerate(rename_candidates, 1):
                 try:
+                    # Find matching subtitle files before renaming video
+                    old_base = os.path.splitext(old_path)[0]
+                    new_base = os.path.splitext(new_path)[0]
+                    subtitle_extensions = ['.srt', '.vtt', '.ass', '.ssa', '.sub']
+                    
+                    subtitle_renames = []
+                    video_dir = os.path.dirname(old_path)
+                    old_filename_base = os.path.splitext(old_name)[0]
+                    new_filename_base = os.path.splitext(new_name)[0]
+                    
+                    # Find all subtitle files that match this video
+                    for file in os.listdir(video_dir):
+                        if file.startswith(old_filename_base):
+                            for sub_ext in subtitle_extensions:
+                                if file.endswith(sub_ext):
+                                    # Create new subtitle name by replacing the base name
+                                    old_sub_path = os.path.join(video_dir, file)
+                                    new_sub_name = file.replace(old_filename_base, new_filename_base, 1)
+                                    new_sub_path = os.path.join(video_dir, new_sub_name)
+                                    
+                                    if old_sub_path != new_sub_path and not os.path.exists(new_sub_path):
+                                        subtitle_renames.append((old_sub_path, new_sub_path))
+                    
+                    # Rename video file
                     os.rename(old_path, new_path)
-                    renamed += 1
+                    renamed_videos += 1
+                    
+                    # Show progress every 25 renames or at completion
+                    if i % 25 == 0 or i == total_to_rename:
+                        print(f"\rRenamed {i} of {total_to_rename}...", end='', flush=True)
+                    
+                    # Update database with new file path and rescan subtitle status
+                    try:
+                        with self.get_db_context() as conn:
+                            cursor = conn.cursor()
+                            cursor.execute('UPDATE video_files SET file_path = ? WHERE file_path = ?', (new_path, old_path))
+                            
+                            # Rescan subtitle status for the renamed file
+                            has_external, has_embedded = self.check_subtitle_status(new_path)
+                            cursor.execute('''
+                                UPDATE video_files 
+                                SET has_external_subs = ?, has_embedded_subs = ? 
+                                WHERE file_path = ?
+                            ''', (has_external, has_embedded, new_path))
+                    except Exception as e:
+                        print(f"Warning: Could not update database for {new_name}: {self.sanitize_error_message(str(e))}")
+                    
+                    # Rename matching subtitle files
+                    for old_sub_path, new_sub_path in subtitle_renames:
+                        try:
+                            os.rename(old_sub_path, new_sub_path)
+                            renamed_subtitles += 1
+                        except OSError as e:
+                            print(f"Warning: Could not rename subtitle {os.path.basename(old_sub_path)}: {self.sanitize_error_message(str(e))}")
+                    
                 except OSError as e:
                     print(f"Error renaming {self.sanitize_path_for_display(old_path)}: {self.sanitize_error_message(str(e))}")
-            print(f"✓ Renamed {renamed} episodes")
+            
+            print(f"\r✓ Renamed {renamed_videos} episodes")
+            if renamed_subtitles > 0:
+                print(f"✓ Renamed {renamed_subtitles} subtitle files")
         
         self.safe_input("\nPress Enter to continue...")
         
@@ -5019,18 +6660,22 @@ class MediaManager:
             print("📝 SUBTITLES:")
             print("11. Check for videos without English subtitles")
             print("12. Download English subtitles")
+            print("13. Subtitle Language Settings & Cleanup")
             print()
             print("🗂️  ORGANIZATION & CLEANUP:")
-            print("13. Smart Organization")
-            print("14. Find Duplicate Videos")
-            print("15. Quick Fixes")
+            print("14. Smart Organization")
+            print("15. Find Duplicate Videos")
+            print("16. Quick Fixes")
             print()
             print("🗑️  FILE MANAGEMENT:")
-            print("16. Delete TV show")
-            print("17. Delete video file")
+            print("17. Delete TV show")
+            print("18. Delete video file")
             print()
             print("☁️  BACKUP & SYNC:")
-            print("18. Backup & Sync (rclone)")
+            print("19. Backup & Sync (rclone)")
+            print()
+            print("⚙️  SETTINGS:")
+            print("20. Configure Scan Folders")
             print()
             print("0. Exit")
             print()
@@ -5049,7 +6694,7 @@ class MediaManager:
                     value = value.strip()
                     # Block any non-alphanumeric characters that could be injection attempts
                     if not value.replace('-', '').isalnum() or len(value) > 3:
-                        print("Invalid menu choice. Please enter a number (0-18).")
+                        print("Invalid menu choice. Please enter a number (0-20).")
                         return None
                     return value
                 
@@ -5134,17 +6779,21 @@ class MediaManager:
                 elif choice == '12':
                     self.download_subtitles()
                 elif choice == '13':
-                    self.smart_organization()
+                    self.manage_language_preferences()
                 elif choice == '14':
-                    self.find_duplicates()
+                    self.smart_organization()
                 elif choice == '15':
-                    self.quick_fixes()
+                    self.find_duplicates()
                 elif choice == '16':
-                    self.delete_show()
+                    self.quick_fixes()
                 elif choice == '17':
-                    self.delete_video_file()
+                    self.delete_show()
                 elif choice == '18':
+                    self.delete_video_file()
+                elif choice == '19':
                     self.backup_sync()
+                elif choice == '20':
+                    self.configure_folders()
                 elif choice == '0':
                     print("\nGoodbye!")
                     break
@@ -5158,11 +6807,6 @@ class MediaManager:
             
             # Safety mechanisms to prevent infinite loops
             iteration_count += 1
-            
-            # Check for excessive runtime (1 hour timeout)
-            if time.time() - self.loop_start_time > 3600:
-                print("⚠️  Menu timeout reached after 1 hour. Exiting for safety.")
-                break
         
         # Check if loop exited due to safety limits
         if iteration_count >= self.max_menu_iterations:
@@ -5753,6 +7397,29 @@ class MediaManager:
         
         incremental_mode = (choice == '2')
         
+        # Check folder configuration
+        with self.get_db_context() as conn:
+            cursor = conn.cursor()
+            cursor.execute('SELECT COUNT(*) FROM folder_config WHERE enabled = 1')
+            configured_folders = cursor.fetchone()[0]
+        
+        if configured_folders == 0:
+            print("\n⚠️  No folders configured for scanning")
+            print("Let's set up which folders to scan...")
+            self.safe_input("\nPress Enter to configure folders...")
+            self.configure_folders()
+            
+            # Check again after configuration
+            with self.get_db_context() as conn:
+                cursor = conn.cursor()
+                cursor.execute('SELECT COUNT(*) FROM folder_config WHERE enabled = 1')
+                configured_folders = cursor.fetchone()[0]
+            
+            if configured_folders == 0:
+                print("\nNo folders configured. Analysis cancelled.")
+                self.safe_input("Press Enter to continue...")
+                return
+        
         print("\n" + "="*60)
         print("🚀 Starting Background Analysis...")
         print("="*60)
@@ -5786,9 +7453,12 @@ class MediaManager:
             'background_tasks': []
         }
         
-        # Ask about auto-fix options
-        print("🔧 Auto-fix options:")
-        auto_download_subs = self.safe_input("Auto-download missing subtitles in background? (y/N): ").lower() == 'y'
+        # Ask about fix options upfront
+        print("\n🔧 What would you like to fix during this scan?")
+        fix_naming = self.safe_input("Fix files with bad names (spaces, periods, TV format)? (y/N): ").lower() == 'y'
+        fix_transcoding = self.safe_input("Transcode videos larger than 1080p? (y/N): ").lower() == 'y'
+        optimize_streaming = self.safe_input("Optimize videos for streaming (convert AVI/FLV/WMV/MOV to MP4)? (y/N): ").lower() == 'y'
+        fix_subtitles = self.safe_input("Download missing subtitles? (y/N): ").lower() == 'y'
         auto_remove_system = self.safe_input("Auto-remove system files (.DS_Store, etc.)? (y/N): ").lower() == 'y'
         check_corruption = self.safe_input("Check for corrupted video files? (y/N): ").lower() == 'y'
         
@@ -5883,31 +7553,41 @@ class MediaManager:
         progress_thread = threading.Thread(target=update_progress_display, daemon=True)
         progress_thread.start()
         
-        # Phase 1: Initial file scan with incremental detection
+        # Phase 1: Initial file scan with real-time discovery progress
         if incremental_mode:
             print("Phase 1: Scanning for new/changed files...")
         else:
-            print("Phase 1: Scanning all video files...")
+            print("Phase 1: Creating index of files...")
             
         all_video_files = []
         files_to_analyze = []
+        discovered_count = 0
         
         for root, dirs, files in os.walk(self.base_path, followlinks=False):
             for file in files:
                 if file.lower().endswith(self.video_extensions):
                     file_path = os.path.join(root, file)
                     all_video_files.append(file_path)
+                    discovered_count += 1
+                    
+                    # Show discovery progress every 100 files
+                    if discovered_count % 100 == 0:
+                        print(f"\r🔍 Creating index of files... Found {discovered_count} so far", end='', flush=True)
                     
                     # Check if file needs analysis
                     if not incremental_mode or self.is_file_changed(file_path):
                         files_to_analyze.append(file_path)
         
+        print(f"\n✓ Found {discovered_count} video files ({len(files_to_analyze)} to analyze)")
+        
         with self._progress_lock:
-            progress['file_scan']['total'] = len(all_video_files)
-        analysis_results['total_files'] = len(all_video_files)
+            progress['file_scan']['total'] = discovered_count
+            progress['file_scan']['current'] = discovered_count
+            progress['file_scan']['complete'] = True
+        analysis_results['total_files'] = discovered_count
         
         if incremental_mode:
-            print(f"Found {len(files_to_analyze)} new/changed files out of {len(all_video_files)} total")
+            print(f"Found {len(files_to_analyze)} new/changed files out of {discovered_count} total")
         else:
             files_to_analyze = all_video_files
         
@@ -5971,8 +7651,18 @@ class MediaManager:
                         if not row['has_external_subs'] and not row['has_embedded_subs']:
                             analysis_results['missing_subtitles'].append(file_path)
         
-        # Analyze only new/changed files
+        # Analyze files in batches with immediate database saves
+        batch_to_save = []  # Collect files to save in batches
+        batch_number = 0
+        
+        print(f"\n🔍 Analyzing {len(files_to_analyze)} files in batches of 100...")
+        
         for i, file_path in enumerate(files_to_analyze):
+            # Show batch progress
+            if i % 100 == 0:
+                batch_number = i // 100 + 1
+                print(f"\r📊 Working on batch {batch_number} (files {i+1}-{min(i+100, len(files_to_analyze))} of {len(files_to_analyze)})", end='', flush=True)
+            
             with self._progress_lock:
                 progress['resolution_analysis']['current'] = i + 1
                 progress['codec_analysis']['current'] = i + 1
@@ -6021,12 +7711,26 @@ class MediaManager:
                                     'size_gb': size_gb,
                                     'codec': codec
                                 })
+                                
+                                # Queue for transcoding (but only after renaming if needed)
+                                # This will be queued later after rename tasks complete
                             
                             # Check codec issues
                             if codec in ['mpeg4', 'xvid', 'divx', 'wmv3']:
                                 analysis_results['codec_issues'].append({
                                     'path': file_path,
                                     'codec': codec
+                                })
+                            
+                            # Check container format for streaming optimization
+                            file_extension = os.path.splitext(file_path)[1].lower()
+                            problematic_containers = ['.avi', '.flv', '.wmv', '.mov', '.mkv']
+                            if file_extension in problematic_containers:
+                                analysis_results.setdefault('container_issues', []).append({
+                                    'path': file_path,
+                                    'container': file_extension,
+                                    'codec': codec,
+                                    'size_gb': stat.st_size / (1024**3)
                                 })
                             
                             # Check large files
@@ -6062,12 +7766,36 @@ class MediaManager:
                     if not ('(' in filename and ')' in filename):
                         issues.append('Missing year in movie title')
                 
-                file_data['naming_issues'] = issues
-                if issues:
-                    analysis_results['naming_issues'].append({
-                        'path': file_path,
-                        'issues': issues
-                    })
+                # Fix naming issues immediately if user requested it
+                if fix_naming and issues:
+                    rename_result = self.rename_file_task(file_path)
+                    if "Renamed to:" in rename_result:
+                        # Update file_path to new path for subsequent processing
+                        directory = os.path.dirname(file_path)
+                        old_filename = os.path.basename(file_path)
+                        new_filename = rename_result.replace("Renamed to: ", "")
+                        new_file_path = os.path.join(directory, new_filename)
+                        
+                        file_path = new_file_path  # Update for rest of processing
+                        file_data['file_path'] = new_file_path
+                        file_data['filename'] = new_filename
+                        file_data['naming_issues'] = []  # Clear since fixed
+                        
+                        found_issues['naming_problems'].append(f"{old_filename} → {new_filename} ✓ FIXED")
+                    else:
+                        file_data['naming_issues'] = issues
+                        found_issues['naming_problems'].append(f"{os.path.basename(file_path)}: {', '.join(issues[:2])}")
+                        analysis_results['naming_issues'].append({
+                            'path': file_path,
+                            'issues': issues
+                        })
+                else:
+                    file_data['naming_issues'] = issues
+                    if issues:
+                        analysis_results['naming_issues'].append({
+                            'path': file_path,
+                            'issues': issues
+                        })
                 
                 # Check subtitles
                 base_name = os.path.splitext(file_path)[0]
@@ -6090,11 +7818,6 @@ class MediaManager:
                 if not has_external_subs and not has_embedded_subs:
                     analysis_results['missing_subtitles'].append(file_path)
                     found_issues['subtitle_issues'].append(f"Missing subtitles: {os.path.basename(file_path)}")
-                    
-                    # Auto-queue subtitle download if enabled
-                    if auto_download_subs and len(self.active_tasks) < self.max_concurrent_tasks:
-                        task_desc = f"Download subtitles for {os.path.basename(file_path)}"
-                        self.add_background_task('subtitle', file_path, self.download_subtitle_task, task_desc)
                 
                 # Check for naming issues and report
                 if issues:
@@ -6105,14 +7828,66 @@ class MediaManager:
                 if file_data.get('codec') in ['mpeg4', 'xvid', 'divx', 'wmv3']:
                     found_issues['codec_problems'].append(f"{os.path.basename(file_path)}: {file_data['codec']}")
                 
-                # Save to database
-                self.save_video_metadata(file_data)
+                # Add to batch instead of saving individually
+                batch_to_save.append(file_data)
+                
+                # Save batch periodically to avoid memory issues
+                if len(batch_to_save) >= 100:
+                    self.save_video_metadata_batch(batch_to_save)
+                    batch_to_save = []
                 
             except (OSError, IOError, ValueError, subprocess.SubprocessError) as e:
                 print(f"Error analyzing {file_path}: {self.sanitize_error_message(str(e))}")
                 continue
             
             time.sleep(0.001 + secrets.SystemRandom().uniform(0, 0.0005))  # Cryptographically secure jitter
+        
+        # Save any remaining files in the batch
+        if batch_to_save:
+            self.save_video_metadata_batch(batch_to_save)
+        
+        # Queue rename tasks if user requested them
+        if fix_naming and analysis_results['naming_issues']:
+            print(f"\n📝 Queueing {len(analysis_results['naming_issues'])} rename tasks...")
+            rename_tasks = []
+            for naming_issue in analysis_results['naming_issues']:
+                file_path = naming_issue['path']
+                issues = naming_issue['issues']
+                task_desc = f"Rename: {os.path.basename(file_path)} ({', '.join(issues[:2])})"
+                task_id = self.add_background_task('rename', file_path, self.rename_file_task, task_desc)
+                rename_tasks.append(task_id)
+            print(f"✓ Queued {len(rename_tasks)} rename tasks")
+        
+        # Queue transcoding tasks if user requested them
+        if fix_transcoding and analysis_results['conversion_candidates']:
+            total_size_gb = sum(c['size_gb'] for c in analysis_results['conversion_candidates'])
+            print(f"\n🎬 Queueing {len(analysis_results['conversion_candidates'])} transcode tasks...")
+            print(f"Total size to process: {total_size_gb:.1f} GB")
+            for candidate in analysis_results['conversion_candidates']:
+                file_path = candidate['path']
+                task_desc = f"Transcode to 1080p: {os.path.basename(file_path)}"
+                self.add_background_task('transcode', file_path, self.transcode_video_task, task_desc)
+            print(f"✓ Queued {len(analysis_results['conversion_candidates'])} transcode tasks")
+        
+        # Queue container optimization tasks if user requested them
+        if optimize_streaming and analysis_results.get('container_issues'):
+            total_size_gb = sum(c['size_gb'] for c in analysis_results['container_issues'])
+            print(f"\n📦 Queueing {len(analysis_results['container_issues'])} container optimization tasks...")
+            print(f"Total size to optimize: {total_size_gb:.1f} GB")
+            for container_issue in analysis_results['container_issues']:
+                file_path = container_issue['path']
+                container = container_issue['container']
+                task_desc = f"Convert {container} to MP4: {os.path.basename(file_path)}"
+                self.add_background_task('optimize', file_path, self.optimize_container_task, task_desc)
+            print(f"✓ Queued {len(analysis_results['container_issues'])} container optimization tasks")
+        
+        # Queue subtitle downloads if user requested them
+        if fix_subtitles and analysis_results['missing_subtitles']:
+            print(f"\n📝 Queueing {len(analysis_results['missing_subtitles'])} subtitle download tasks...")
+            for file_path in analysis_results['missing_subtitles']:
+                task_desc = f"Download subtitles for {os.path.basename(file_path)}"
+                self.add_background_task('subtitle', file_path, self.download_subtitle_task, task_desc)
+            print(f"✓ Queued {len(analysis_results['missing_subtitles'])} subtitle download tasks")
         
         with self._progress_lock:
             progress['resolution_analysis']['complete'] = True
@@ -6442,8 +8217,12 @@ class MediaManager:
         with self.get_db_context() as conn:
             cursor = conn.cursor()
             
-            # Get conversion candidates
-            cursor.execute('SELECT * FROM video_files WHERE needs_conversion = 1')
+            # Get conversion candidates (Movies and TV only)
+            cursor.execute('''
+                SELECT * FROM video_files 
+                WHERE needs_conversion = 1
+                AND (file_path LIKE '%/Movies/%' OR file_path LIKE '%/TV/%')
+            ''')
             for row in cursor.fetchall():
                 results['conversion_candidates'].append({
                     'path': row['file_path'],
@@ -6453,16 +8232,24 @@ class MediaManager:
                     'codec': row['codec']
                 })
             
-            # Get naming issues
-            cursor.execute('SELECT * FROM video_files WHERE naming_issues IS NOT NULL')
+            # Get naming issues (Movies and TV only)
+            cursor.execute('''
+                SELECT * FROM video_files 
+                WHERE naming_issues IS NOT NULL
+                AND (file_path LIKE '%/Movies/%' OR file_path LIKE '%/TV/%')
+            ''')
             for row in cursor.fetchall():
                 results['naming_issues'].append({
                     'path': row['file_path'],
                     'issues': row['naming_issues'].split(',')
                 })
             
-            # Get missing subtitles
-            cursor.execute('SELECT * FROM video_files WHERE has_external_subs = 0 AND has_embedded_subs = 0')
+            # Get missing subtitles (Movies and TV only)
+            cursor.execute('''
+                SELECT * FROM video_files 
+                WHERE has_external_subs = 0 AND has_embedded_subs = 0
+                AND (file_path LIKE '%/Movies/%' OR file_path LIKE '%/TV/%')
+            ''')
             for row in cursor.fetchall():
                 results['missing_subtitles'].append(row['file_path'])
             
