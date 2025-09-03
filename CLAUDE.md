@@ -38,7 +38,7 @@ This is a comprehensive media library management system with a primary Python ap
 ### Key Components
 
 1. **media_manager.py** - Comprehensive media library management application
-   - 20 menu options organized by category (Analysis, Processing, Subtitles, Organization, Backup, Settings)
+   - 21 menu options organized by category (Analysis, Processing, Subtitles, Organization, Backup, Settings)
    - SQLite database for metadata caching and performance
    - Background analysis with progress tracking and recommendations
    - Batch operations for bulk video processing
@@ -46,13 +46,15 @@ This is a comprehensive media library management system with a primary Python ap
    - Smart organization with Plex naming compliance
    - Subtitle management (download and check external/embedded)
    - Storage analytics and duplicate detection
+   - Manual file correction with TMDB API integration for proper naming
    - Configurable folder scanning with movie/TV type designation
 
 2. **media_library.db** - SQLite database (auto-created)
    - Caches video metadata (resolution, codec, subtitles, file stats)
    - Stores analysis sessions and recommendations
+   - Stores manual file corrections with TMDB metadata
    - Enables incremental scanning (only new/modified files)
-   - Provides fast queries for complex analysis
+   - Provides instant queries for all analysis operations
 
 3. **convert.py** - Legacy standalone video conversion utility
    - Converts videos >2GB or >1080p resolution to 1080p MP4
@@ -86,8 +88,9 @@ This is a comprehensive media library management system with a primary Python ap
 ### Dependencies
 
 - **Python 3.x** with standard library
+- **requests** - HTTP library for TMDB API calls (pip install requests)
 - **FFmpeg** - Video processing and analysis
-- **subliminal** - Subtitle downloading (pip install subliminal)
+- **subliminal** - Subtitle downloading (pip install subliminal) 
 - **rclone** - Cloud backup/sync (brew install rclone)
 - **SQLite** - Built into Python, no additional install needed
 
@@ -112,6 +115,9 @@ This is a comprehensive media library management system with a primary Python ap
 - **Parallel Processing**: Configurable concurrent subtitle downloads (default: 8)
 - **Language Preferences**: Configure which subtitle languages to keep/remove
 - **Personal Content Exclusion**: Non-TV/Movie folders automatically excluded from media operations
+- **TMDB Integration**: Manual file correction with movie/TV database lookup for accurate Plex naming
+- **Automated Task Execution**: Full scans now execute all requested fixes (conversion, subtitles, etc.)
+- **Performance Optimization**: All size analysis operations use database queries for instant results
 
 ### Security Features
 
@@ -129,9 +135,10 @@ This is a comprehensive media library management system with a primary Python ap
 ### Workflow Recommendations
 
 1. **First-time setup**: Run Option 1 (Background Analysis) for comprehensive library overview
-2. **Regular maintenance**: Use incremental analysis to check for new files
-3. **Storage optimization**: Follow high-priority recommendations from analysis
-4. **Cloud backup**: Configure rclone remotes and use Option 18 for backup
+2. **Regular maintenance**: Use incremental analysis to check for new files  
+3. **Manual corrections**: Use Option 17 to fix misnamed files with TMDB lookup (requires free API key)
+4. **Storage optimization**: Options 3-5 provide instant database-powered file size analysis
+5. **Cloud backup**: Configure rclone remotes and use Option 20 for backup
 
 ### Important Notes
 
@@ -139,6 +146,7 @@ This is a comprehensive media library management system with a primary Python ap
 - All operations include progress tracking and confirmation prompts
 - Analysis results are cached for 24 hours by default
 - Cloud sync requires rclone configuration (run `rclone config`)
+- TMDB integration requires free API key from https://www.themoviedb.org/settings/api
 - FFmpeg must be installed and available in PATH
 
 ### Security Architecture

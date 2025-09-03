@@ -20,6 +20,7 @@ import signal
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import errno
 import stat
+import requests
 
 # Safe file size constants to prevent integer overflow
 class FileSizeConstants:
@@ -142,6 +143,89 @@ class DatabaseContext:
             self.conn.close()
         return False
 
+class TMDBLookup:
+    """Handle TMDB API lookups for movie and TV show metadata."""
+    
+    def __init__(self):
+        self.api_key = None
+        self.base_url = "https://api.themoviedb.org/3"
+        self.session = requests.Session()
+        self.session.timeout = TimeoutConstants.STANDARD
+        
+    def set_api_key(self, api_key):
+        """Set TMDB API key."""
+        if not api_key or not isinstance(api_key, str) or len(api_key) < 10:
+            raise ValueError("Invalid TMDB API key")
+        self.api_key = api_key
+        
+    def search_movie(self, title, year=None):
+        """Search for a movie by title and optional year."""
+        if not self.api_key:
+            raise ValueError("TMDB API key not set")
+            
+        params = {
+            'api_key': self.api_key,
+            'query': title
+        }
+        if year:
+            params['year'] = year
+            
+        try:
+            response = self.session.get(f"{self.base_url}/search/movie", params=params)
+            response.raise_for_status()
+            return response.json()
+        except requests.RequestException as e:
+            print(f"TMDB API error: {str(e)}")
+            return None
+            
+    def search_tv(self, title, year=None):
+        """Search for a TV show by title and optional year."""
+        if not self.api_key:
+            raise ValueError("TMDB API key not set")
+            
+        params = {
+            'api_key': self.api_key,
+            'query': title
+        }
+        if year:
+            params['first_air_date_year'] = year
+            
+        try:
+            response = self.session.get(f"{self.base_url}/search/tv", params=params)
+            response.raise_for_status()
+            return response.json()
+        except requests.RequestException as e:
+            print(f"TMDB API error: {str(e)}")
+            return None
+            
+    def get_movie_details(self, movie_id):
+        """Get detailed movie information by TMDB ID."""
+        if not self.api_key:
+            raise ValueError("TMDB API key not set")
+            
+        try:
+            response = self.session.get(f"{self.base_url}/movie/{movie_id}", 
+                                      params={'api_key': self.api_key})
+            response.raise_for_status()
+            return response.json()
+        except requests.RequestException as e:
+            print(f"TMDB API error: {str(e)}")
+            return None
+            
+    def get_tv_details(self, tv_id):
+        """Get detailed TV show information by TMDB ID."""
+        if not self.api_key:
+            raise ValueError("TMDB API key not set")
+            
+        try:
+            response = self.session.get(f"{self.base_url}/tv/{tv_id}", 
+                                      params={'api_key': self.api_key})
+            response.raise_for_status()
+            return response.json()
+        except requests.RequestException as e:
+            print(f"TMDB API error: {str(e)}")
+            return None
+
 class MediaManager:
     def __init__(self, base_path="/Volumes/media/Video"):
         # Validate and normalize base path
@@ -212,6 +296,9 @@ class MediaManager:
         self.max_directory_depth = 20  # Prevent deep recursion
         self.max_path_length = 4096      # Prevent path length attacks
         self.files_scanned_count = 0
+        
+        # Initialize TMDB lookup instance
+        self.tmdb = TMDBLookup()
         
         # Signal handling for graceful shutdown
         self._shutdown_requested = False
@@ -290,6 +377,24 @@ class MediaManager:
                 )
             ''')
             
+            # Create manual corrections table
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS manual_corrections (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    original_file_path TEXT NOT NULL,
+                    original_filename TEXT NOT NULL,
+                    corrected_title TEXT NOT NULL,
+                    corrected_year INTEGER,
+                    media_type TEXT NOT NULL CHECK(media_type IN ('movie', 'tv')),
+                    tmdb_id INTEGER,
+                    tmdb_title TEXT,
+                    tmdb_year INTEGER,
+                    correction_date REAL NOT NULL,
+                    applied BOOLEAN DEFAULT 0,
+                    UNIQUE(original_file_path)
+                )
+            ''')
+            
             # Add default folders if not already configured
             cursor.execute('SELECT COUNT(*) FROM folder_config')
             if cursor.fetchone()[0] == 0:
@@ -310,6 +415,8 @@ class MediaManager:
             cursor.execute('CREATE INDEX IF NOT EXISTS idx_needs_conversion ON video_files(needs_conversion)')
             cursor.execute('CREATE INDEX IF NOT EXISTS idx_naming_issues ON video_files(naming_issues)')
             cursor.execute('CREATE INDEX IF NOT EXISTS idx_folder_type ON folder_config(folder_type)')
+            cursor.execute('CREATE INDEX IF NOT EXISTS idx_corrections_applied ON manual_corrections(applied)')
+            cursor.execute('CREATE INDEX IF NOT EXISTS idx_corrections_media_type ON manual_corrections(media_type)')
         
         # Set secure file permissions on database (readable/writable by owner only)
         try:
@@ -1142,6 +1249,13 @@ class MediaManager:
                     settings = json.load(f)
                     self.preferred_languages = settings.get('preferred_languages', ['en', 'eng', 'english'])
                     self.max_parallel_downloads = settings.get('max_parallel_downloads', 8)
+                    # Load TMDB API key if available
+                    api_key = settings.get('tmdb_api_key')
+                    if api_key:
+                        try:
+                            self.tmdb.set_api_key(api_key)
+                        except ValueError:
+                            pass  # Invalid key, will prompt user later
             except (json.JSONDecodeError, IOError):
                 pass  # Use defaults if file is corrupted
     
@@ -1149,8 +1263,27 @@ class MediaManager:
         """Save user settings to JSON file."""
         settings = {
             'preferred_languages': self.preferred_languages,
-            'max_parallel_downloads': self.max_parallel_downloads
+            'max_parallel_downloads': self.max_parallel_downloads,
+            'tmdb_api_key': self.tmdb.api_key
         }
+        try:
+            with open(self.settings_file, 'w') as f:
+                json.dump(settings, f, indent=2)
+        except IOError:
+            print("Warning: Could not save settings file")
+            
+    def load_settings_dict(self):
+        """Load settings as dictionary."""
+        if os.path.exists(self.settings_file):
+            try:
+                with open(self.settings_file, 'r') as f:
+                    return json.load(f)
+            except (json.JSONDecodeError, IOError):
+                pass
+        return {}
+        
+    def save_settings_dict(self, settings):
+        """Save settings dictionary to file."""
         try:
             with open(self.settings_file, 'w') as f:
                 json.dump(settings, f, indent=2)
@@ -2075,6 +2208,55 @@ class MediaManager:
         except (OSError, IOError) as e:
             return f"Error renaming: {self.sanitize_error_message(str(e))}"
     
+    def rename_file_task_no_db(self, file_path):
+        """Rename file without database update (for batching)."""
+        try:
+            if not os.path.exists(file_path):
+                return {'success': False, 'error': f"File not found: {file_path}"}
+                
+            directory = os.path.dirname(file_path)
+            filename = os.path.basename(file_path)
+            new_filename = filename
+            
+            # Fix double spaces
+            new_filename = re.sub(r'\s+', ' ', new_filename)
+            
+            # Fix double periods (except for file extension)
+            name, ext = os.path.splitext(new_filename)
+            name = re.sub(r'\.+', '.', name)
+            new_filename = name + ext
+            
+            # Fix TV show naming for Plex (convert common formats to S##E## format)
+            tv_patterns = [
+                (r'(\d+)x(\d+)', r'S\1E\2'),  # 1x01 -> S01E01
+                (r'[Ss](\d{1,2})[Ee](\d{1,2})', lambda m: f'S{m.group(1).zfill(2)}E{m.group(2).zfill(2)}'),  # s1e1 -> S01E01
+            ]
+            
+            for pattern, replacement in tv_patterns:
+                new_filename = re.sub(pattern, replacement, new_filename)
+            
+            # Only rename if changed
+            if new_filename != filename:
+                new_path = os.path.join(directory, new_filename)
+                
+                # Check if target exists
+                if os.path.exists(new_path):
+                    return {'success': False, 'error': f"Cannot rename: {new_filename} already exists"}
+                
+                os.rename(file_path, new_path)
+                
+                return {
+                    'success': True, 
+                    'new_path': new_path, 
+                    'new_filename': new_filename,
+                    'old_path': file_path
+                }
+            else:
+                return {'success': False, 'error': 'No renaming needed'}
+                
+        except (OSError, IOError) as e:
+            return {'success': False, 'error': f"Error renaming: {self.sanitize_error_message(str(e))}"}
+    
     def transcode_video_task(self, file_path):
         """Background task for transcoding videos to 1080p."""
         try:
@@ -2324,156 +2506,287 @@ class MediaManager:
         
     def list_conversion_candidates(self):
         """List videos that are candidates for conversion."""
-        print("\nFinding conversion candidates...")
+        print("\nFinding conversion candidates from database...")
         
-        # Direct method implementation - no temporary scripts
-        candidates = []
+        # Query database for conversion candidates
+        with self.get_db_context() as conn:
+            cursor = conn.cursor()
+            cursor.execute('''
+                SELECT file_path, filename, width, height, file_size, codec
+                FROM video_files
+                WHERE (width > 1920 OR height > 1080)
+                AND filename NOT LIKE '%-CONVERTED%'
+                ORDER BY file_size DESC
+            ''')
+            candidates = cursor.fetchall()
         
-        # Count total files first
-        total_files = 0
-        for root, _, files in os.walk(self.base_path, followlinks=False):
-            for file in files:
-                if (file.lower().endswith(('.mp4', '.mkv', '.avi', '.mov', '.flv')) 
-                    and "-CONVERTED" not in file):
-                    total_files += 1
-        
-        print(f"Scanning {total_files} video files for resolution...")
-        files_checked = 0
-        
-        for root, _, files in os.walk(self.base_path, followlinks=False):
-            for file in files:
-                if "-CONVERTED" in file:
-                    continue
-                    
-                file_path = os.path.join(root, file)
-                if file.lower().endswith(('.mp4', '.mkv', '.avi', '.mov', '.flv')):
-                    files_checked += 1
-                    if files_checked % 5 == 0:
-                        print(f"Checked {files_checked}/{total_files} files...", end='\r')
-                    
-                    width, height = self.get_video_resolution_safe(file_path)
-                    if width and height and (width > 1920 or height > 1080):
-                        try:
-                            file_size_gb = os.path.getsize(file_path) / (1024 ** 3)
-                            candidates.append(f"{file_path}|{width}x{height}|{file_size_gb:.2f}")
-                        except OSError:
-                            continue
-        
-        print(f"\nScan complete! Checked {files_checked} files")
-        
-        if candidates:
-            print(f"\nFound {len(candidates)} videos larger than 1080p:\n")
-            
-            # Parse candidates list 
-            parsed_candidates = []
-            for line in candidates:
-                if '|' in line:
-                    path, resolution, size = line.split('|')
-                    parsed_candidates.append((path, resolution, float(size)))
-            
-            # Save to file in secure location
-            candidates_file = os.path.join(self.base_path, "conversion_candidates.txt")
-            if not self.validate_safe_path(candidates_file):
-                print("Error: Cannot write candidates file to unsafe location")
-                return
-            
-            with open(candidates_file, "w") as f:
-                f.write(f"Conversion Candidates - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
-                f.write("="*80 + "\n\n")
-                for path, res, size in sorted(parsed_candidates, key=lambda x: x[2], reverse=True):
-                    f.write(f"{res} - {size:.2f} GB - {path}\n")
-            
-            # Display summary
-            for i, (path, res, size) in enumerate(parsed_candidates[:10], 1):
-                print(f"{i}. {os.path.basename(path)}")
-                print(f"   Resolution: {res}, Size: {size:.2f} GB")
-            
-            if len(parsed_candidates) > 10:
-                print(f"\n... and {len(parsed_candidates) - 10} more")
-            
-            print(f"\nFull list saved to: conversion_candidates.txt")
-        else:
+        if not candidates:
             print("No videos found that need conversion.")
+            print("(Run Background Analysis if you haven't scanned recently)")
+            self.safe_input("\nPress Enter to continue...")
+            return
+            
+        print(f"\nFound {len(candidates)} videos larger than 1080p:")
+        print("="*80)
+        
+        # Group by directory for better organization
+        by_directory = {}
+        total_size = 0
+        
+        for file_path, filename, width, height, file_size, codec in candidates:
+            directory = os.path.dirname(file_path).replace(self.base_path, '').strip('/')
+            if not directory:
+                directory = "Root"
+                
+            if directory not in by_directory:
+                by_directory[directory] = []
+                
+            size_gb = file_size / (1024**3)
+            total_size += file_size
+            
+            by_directory[directory].append({
+                'filename': filename,
+                'resolution': f"{width}x{height}",
+                'size_gb': size_gb,
+                'codec': codec,
+                'path': file_path
+            })
+        
+        # Display organized results
+        display_count = 0
+        for directory, files in sorted(by_directory.items()):
+            if display_count >= 20:  # Show first 20 files
+                break
+                
+            print(f"\n📁 {directory}/")
+            for file in files[:5]:  # Show up to 5 per directory
+                if display_count >= 20:
+                    break
+                display_count += 1
+                print(f"  {file['filename']}")
+                print(f"    {file['resolution']} | {file['size_gb']:.2f} GB | {file['codec']}")
+        
+        if len(candidates) > 20:
+            print(f"\n... and {len(candidates) - 20} more files")
+        
+        # Summary statistics
+        potential_savings = total_size * 0.4  # Estimate 40% size reduction
+        print(f"\n📊 Summary:")
+        print(f"Total files: {len(candidates)}")
+        print(f"Total size: {total_size / (1024**3):.2f} GB")
+        print(f"Potential savings: ~{potential_savings / (1024**3):.2f} GB")
+        
+        # Save detailed report
+        candidates_file = os.path.join(self.base_path, "conversion_candidates.txt")
+        with open(candidates_file, "w") as f:
+            f.write(f"Conversion Candidates Report - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+            f.write("="*80 + "\n\n")
+            f.write(f"Total candidates: {len(candidates)}\n")
+            f.write(f"Total size: {total_size / (1024**3):.2f} GB\n")
+            f.write(f"Potential savings: ~{potential_savings / (1024**3):.2f} GB\n\n")
+            
+            for directory, files in sorted(by_directory.items()):
+                f.write(f"\n{directory}/\n")
+                f.write("-" * len(directory) + "--\n")
+                for file in sorted(files, key=lambda x: x['size_gb'], reverse=True):
+                    f.write(f"  {file['filename']} - {file['resolution']} - {file['size_gb']:.2f} GB - {file['codec']}\n")
+        
+        print(f"\n📄 Detailed report saved to: conversion_candidates.txt")
+        
+        # Offer conversion
+        convert = self.safe_input("\nWould you like to start converting these files? (y/N): ")
+        if convert.lower() == 'y':
+            print("\n🎥 Starting batch conversion to 1080p...")
+            converted = 0
+            for file_path, filename, width, height, file_size, codec in candidates[:10]:  # Convert first 10 as example
+                print(f"\rConverting {converted + 1}/{min(10, len(candidates))}: {filename}", end='', flush=True)
+                result = self.transcode_video_task(file_path)
+                if "successfully" in result.lower():
+                    converted += 1
+            print(f"\n✓ Converted {converted} files!")
         
         self.safe_input("\nPress Enter to continue...")
         
     def top_shows_by_size(self):
         """Show top 10 TV shows by total size."""
-        print("\nCalculating top 10 shows by size...")
+        print("\nCalculating top 10 shows by size from database...")
         
-        tv_path = os.path.join(self.base_path, "TV")
-        show_sizes = {}
+        # Use database for fast aggregation
+        with self.get_db_context() as conn:
+            cursor = conn.cursor()
+            cursor.execute('''
+                SELECT 
+                    SUBSTR(file_path, 1, INSTR(SUBSTR(file_path, LENGTH(?) + 5), '/') + LENGTH(?) + 4) as show_path,
+                    COUNT(*) as file_count,
+                    SUM(file_size) as total_size,
+                    COUNT(CASE WHEN width > 1920 OR height > 1080 THEN 1 END) as oversized_count
+                FROM video_files
+                WHERE file_path LIKE ?
+                GROUP BY show_path
+                ORDER BY total_size DESC
+                LIMIT 10
+            ''', (os.path.join(self.base_path, 'TV'), os.path.join(self.base_path, 'TV'), os.path.join(self.base_path, 'TV') + '/%'))
+            
+            shows = cursor.fetchall()
         
-        if os.path.exists(tv_path):
-            for show_dir in os.listdir(tv_path):
-                show_path = os.path.join(tv_path, show_dir)
-                if os.path.isdir(show_path):
-                    total_size = 0
-                    file_count = 0
-                    
-                    for root, dirs, files in os.walk(show_path, followlinks=False):
-                        for file in files:
-                            if file.lower().endswith(self.video_extensions):
-                                try:
-                                    total_size += os.path.getsize(os.path.join(root, file))
-                                    file_count += 1
-                                except OSError:
-                                    continue
-                    
-                    if total_size > 0:
-                        show_sizes[show_dir] = {
-                            'size': total_size,
-                            'size_gb': total_size / (1024**3),
-                            'file_count': file_count
-                        }
-        
-        # Sort by size
-        sorted_shows = sorted(show_sizes.items(), key=lambda x: x[1]['size'], reverse=True)
-        
+        if not shows:
+            print("No TV shows found in database. Run Background Analysis first.")
+            self.safe_input("\nPress Enter to continue...")
+            return
+            
         print("\nTop 10 TV Shows by Size:")
         print("="*60)
         
-        for i, (show, info) in enumerate(sorted_shows[:10], 1):
-            print(f"{i:2}. {show}")
-            print(f"    Size: {info['size_gb']:.2f} GB | Episodes: {info['file_count']}")
+        show_data = []
+        for show_path, file_count, total_size, oversized_count in shows:
+            show_name = os.path.basename(show_path)
+            size_gb = total_size / (1024**3)
+            show_data.append({
+                'path': show_path,
+                'name': show_name,
+                'size_gb': size_gb,
+                'file_count': file_count,
+                'oversized_count': oversized_count
+            })
+            
+        for i, show in enumerate(show_data, 1):
+            print(f"{i:2}. {show['name']}")
+            print(f"    Size: {show['size_gb']:.2f} GB | Episodes: {show['file_count']}")
+            if show['oversized_count'] > 0:
+                print(f"    ⚠️  {show['oversized_count']} episodes larger than 1080p")
         
-        total_size = sum(info['size'] for _, info in show_sizes.items())
-        print(f"\nTotal TV Shows: {len(show_sizes)}")
+        # Calculate totals
+        with self.get_db_context() as conn:
+            cursor = conn.cursor()
+            cursor.execute('''
+                SELECT COUNT(DISTINCT SUBSTR(file_path, 1, INSTR(SUBSTR(file_path, LENGTH(?) + 5), '/') + LENGTH(?) + 4)),
+                       SUM(file_size)
+                FROM video_files
+                WHERE file_path LIKE ?
+            ''', (os.path.join(self.base_path, 'TV'), os.path.join(self.base_path, 'TV'), os.path.join(self.base_path, 'TV') + '/%'))
+            total_shows, total_size = cursor.fetchone()
+        
+        print(f"\nTotal TV Shows: {total_shows}")
         print(f"Total Size: {total_size / (1024**3):.2f} GB")
+        
+        # Ask about conversion
+        total_oversized = sum(show['oversized_count'] for show in show_data)
+        if total_oversized > 0:
+            print(f"\n⚡ {total_oversized} episodes could be converted to 1080p to save space")
+            convert = self.safe_input("\nWould you like to convert shows with oversized episodes? (y/N): ")
+            
+            if convert.lower() == 'y':
+                print("\nSelect shows to convert (comma-separated numbers, e.g., '1,3,5'):")
+                selection = self.safe_input("Selection (or 'all' for all shows): ")
+                
+                if selection.lower() == 'all':
+                    selected_shows = [s for s in show_data if s['oversized_count'] > 0]
+                else:
+                    try:
+                        indices = [int(x.strip()) - 1 for x in selection.split(',')]
+                        selected_shows = [show_data[i] for i in indices if 0 <= i < len(show_data) and show_data[i]['oversized_count'] > 0]
+                    except (ValueError, IndexError):
+                        print("Invalid selection.")
+                        self.safe_input("\nPress Enter to continue...")
+                        return
+                
+                if selected_shows:
+                    print(f"\n🎥 Converting oversized episodes in {len(selected_shows)} shows...")
+                    for show in selected_shows:
+                        self.convert_show_episodes(show['path'])
+                    print("\n✓ Conversion complete!")
         
         self.safe_input("\nPress Enter to continue...")
         
+    def convert_show_episodes(self, show_path):
+        """Convert all oversized episodes in a TV show to 1080p."""
+        with self.get_db_context() as conn:
+            cursor = conn.cursor()
+            cursor.execute('''
+                SELECT file_path 
+                FROM video_files 
+                WHERE file_path LIKE ? 
+                AND (width > 1920 OR height > 1080)
+            ''', (show_path + '/%',))
+            
+            episodes = cursor.fetchall()
+            
+        show_name = os.path.basename(show_path)
+        print(f"\nConverting {len(episodes)} episodes from '{show_name}'...")
+        
+        converted_count = 0
+        for i, (file_path,) in enumerate(episodes, 1):
+            print(f"\rConverting {i}/{len(episodes)}: {os.path.basename(file_path)}", end='', flush=True)
+            result = self.transcode_video_task(file_path)
+            if "successfully" in result.lower():
+                converted_count += 1
+                
+        print(f"\n✓ Converted {converted_count}/{len(episodes)} episodes in '{show_name}'")
+        
     def top_video_files(self):
         """Show top 10 individual video files by size."""
-        print("\nFinding top 10 largest video files...")
+        print("\nFinding top 10 largest video files from database...")
         
-        all_videos = []
+        # Query database for largest files
+        with self.get_db_context() as conn:
+            cursor = conn.cursor()
+            cursor.execute('''
+                SELECT file_path, filename, file_size, width, height, codec, duration
+                FROM video_files
+                ORDER BY file_size DESC
+                LIMIT 10
+            ''')
+            videos = cursor.fetchall()
         
-        for root, dirs, files in os.walk(self.base_path, followlinks=False):
-            for file in files:
-                if file.lower().endswith(self.video_extensions):
-                    file_path = os.path.join(root, file)
-                    try:
-                        size = os.path.getsize(file_path)
-                        all_videos.append({
-                            'path': file_path,
-                            'name': file,
-                            'size': size,
-                            'size_gb': size / (1024**3),
-                            'relative_path': os.path.relpath(file_path, self.base_path)
-                        })
-                    except OSError:
-                        continue
-        
-        # Sort by size
-        sorted_videos = sorted(all_videos, key=lambda x: x['size'], reverse=True)
-        
+        if not videos:
+            print("No video files found in database. Run Background Analysis first.")
+            self.safe_input("\nPress Enter to continue...")
+            return
+            
         print("\nTop 10 Largest Video Files:")
         print("="*80)
         
-        for i, video in enumerate(sorted_videos[:10], 1):
-            print(f"{i:2}. {video['name']} ({video['size_gb']:.2f} GB)")
-            print(f"    {video['relative_path']}")
+        video_data = []
+        for file_path, filename, file_size, width, height, codec, duration in videos:
+            size_gb = file_size / (1024**3)
+            relative_path = os.path.relpath(file_path, self.base_path)
+            resolution = f"{width}x{height}" if width and height else "Unknown"
+            duration_min = int(duration / 60) if duration else 0
+            
+            video_data.append({
+                'path': file_path,
+                'filename': filename,
+                'size_gb': size_gb,
+                'relative_path': relative_path,
+                'resolution': resolution,
+                'codec': codec,
+                'duration_min': duration_min,
+                'oversized': (width and height and (width > 1920 or height > 1080))
+            })
+        
+        for i, video in enumerate(video_data, 1):
+            print(f"{i:2}. {video['filename']} ({video['size_gb']:.2f} GB)")
+            print(f"    📍 {video['relative_path']}")
+            print(f"    📐 {video['resolution']} | 🎬 {video['codec']} | ⏱️  {video['duration_min']} min")
+            if video['oversized']:
+                print(f"    ⚠️  Can be reduced to 1080p")
+            print()
+        
+        # Offer conversion for oversized files
+        oversized_videos = [v for v in video_data if v['oversized']]
+        if oversized_videos:
+            print(f"⚡ {len(oversized_videos)} of these files could be converted to 1080p to save space")
+            convert = self.safe_input("\nWould you like to convert oversized files? (y/N): ")
+            
+            if convert.lower() == 'y':
+                print("\n🎥 Converting oversized files to 1080p...")
+                converted = 0
+                for video in oversized_videos:
+                    print(f"\rConverting {converted + 1}/{len(oversized_videos)}: {video['filename']}", end='', flush=True)
+                    result = self.transcode_video_task(video['path'])
+                    if "successfully" in result.lower():
+                        converted += 1
+                print(f"\n✓ Converted {converted} files!")
         
         self.safe_input("\nPress Enter to continue...")
         
@@ -4494,6 +4807,294 @@ class MediaManager:
         
         self.safe_input("\nPress Enter to continue...")
         
+    def manual_file_correction(self):
+        """Manual file correction with TMDB lookup."""
+        self.clear_screen()
+        print("🎬 Manual File Correction with TMDB Lookup")
+        print("="*60)
+        
+        # Check if TMDB API key is configured
+        if not self.tmdb.api_key:
+            print("📋 TMDB API Key Setup Required")
+            print("\nTo use this feature, you need a free TMDB API key.")
+            print("1. Visit: https://www.themoviedb.org/settings/api")
+            print("2. Create an account and request an API key")
+            print("3. Enter the key below (it will be saved for future use)")
+            print()
+            
+            api_key = self.safe_input("Enter TMDB API key (or press Enter to skip): ").strip()
+            if not api_key:
+                print("Skipping TMDB correction.")
+                self.safe_input("\nPress Enter to continue...")
+                return
+                
+            try:
+                self.tmdb.set_api_key(api_key)
+                # Save API key to settings
+                self.save_tmdb_api_key(api_key)
+                print("✓ API key saved successfully!")
+            except ValueError as e:
+                print(f"❌ Invalid API key: {e}")
+                self.safe_input("\nPress Enter to continue...")
+                return
+        
+        # Show files that might need correction
+        print("\n🔍 Finding files that might need correction...")
+        candidates = self.find_correction_candidates()
+        
+        if not candidates:
+            print("✓ No obvious correction candidates found!")
+            print("All files appear to be properly named.")
+            self.safe_input("\nPress Enter to continue...")
+            return
+            
+        print(f"\nFound {len(candidates)} files that might need correction:")
+        print("="*60)
+        
+        # Show candidates with numbers
+        for i, (file_path, filename, issues) in enumerate(candidates[:20], 1):
+            relative_path = os.path.relpath(file_path, self.base_path)
+            print(f"{i:2}. {filename}")
+            print(f"    📍 {relative_path}")
+            print(f"    ⚠️  Issues: {', '.join(issues)}")
+            print()
+            
+        if len(candidates) > 20:
+            print(f"... and {len(candidates) - 20} more files")
+            print()
+        
+        # Let user select files to correct
+        print("Options:")
+        print("• Enter file numbers to correct (e.g., '1,3,5' or '1-10')")
+        print("• Enter 'all' to correct all files")
+        print("• Press Enter to cancel")
+        print()
+        
+        selection = self.safe_input("Select files to correct: ").strip()
+        if not selection:
+            return
+            
+        # Parse selection
+        selected_indices = self.parse_selection(selection, len(candidates))
+        if not selected_indices:
+            print("Invalid selection.")
+            self.safe_input("\nPress Enter to continue...")
+            return
+            
+        # Process selected files
+        for idx in selected_indices:
+            file_path, filename, issues = candidates[idx]
+            print(f"\n{'='*60}")
+            print(f"Correcting: {filename}")
+            print(f"Issues: {', '.join(issues)}")
+            
+            self.correct_single_file(file_path, filename)
+        
+        self.safe_input(f"\n✓ Correction workflow complete! Press Enter to continue...")
+        
+    def save_tmdb_api_key(self, api_key):
+        """Save TMDB API key to settings."""
+        settings = self.load_settings_dict()
+        settings['tmdb_api_key'] = api_key
+        self.save_settings_dict(settings)
+        
+    def load_tmdb_api_key(self):
+        """Load TMDB API key from settings."""
+        settings = self.load_settings_dict()
+        api_key = settings.get('tmdb_api_key')
+        if api_key:
+            try:
+                self.tmdb.set_api_key(api_key)
+            except ValueError:
+                pass  # Invalid key, will prompt user later
+                
+    def find_correction_candidates(self):
+        """Find files that might need manual correction."""
+        candidates = []
+        
+        # Look through video files in database for potential issues
+        with self.get_db_context() as conn:
+            cursor = conn.cursor()
+            cursor.execute('''
+                SELECT file_path, filename, naming_issues 
+                FROM video_files 
+                WHERE naming_issues IS NOT NULL AND naming_issues != ''
+                ORDER BY file_path
+            ''')
+            
+            for file_path, filename, naming_issues in cursor.fetchall():
+                if os.path.exists(file_path):
+                    issues = naming_issues.split(', ') if naming_issues else []
+                    candidates.append((file_path, filename, issues))
+        
+        return candidates
+        
+    def parse_selection(self, selection, max_count):
+        """Parse user selection string into list of indices."""
+        if selection.lower() == 'all':
+            return list(range(max_count))
+            
+        indices = []
+        parts = selection.split(',')
+        
+        for part in parts:
+            part = part.strip()
+            if '-' in part:
+                # Range like "1-5"
+                try:
+                    start, end = part.split('-', 1)
+                    start_idx = int(start) - 1  # Convert to 0-based
+                    end_idx = int(end) - 1
+                    if 0 <= start_idx <= end_idx < max_count:
+                        indices.extend(range(start_idx, end_idx + 1))
+                except ValueError:
+                    return None
+            else:
+                # Single number
+                try:
+                    idx = int(part) - 1  # Convert to 0-based
+                    if 0 <= idx < max_count:
+                        indices.append(idx)
+                except ValueError:
+                    return None
+                    
+        return sorted(list(set(indices)))  # Remove duplicates and sort
+        
+    def correct_single_file(self, file_path, filename):
+        """Correct a single file using TMDB lookup."""
+        print(f"\n📝 Manual Correction for: {filename}")
+        
+        # Determine if this is a movie or TV show based on path
+        media_type = 'movie' if '/Movies/' in file_path else 'tv'
+        print(f"📁 Detected type: {media_type}")
+        
+        # Get user input for correction
+        print(f"\nPlease provide the correct information:")
+        corrected_title = self.safe_input("Title: ").strip()
+        if not corrected_title:
+            print("❌ No title provided, skipping.")
+            return
+            
+        year_input = self.safe_input("Year (optional): ").strip()
+        corrected_year = None
+        if year_input:
+            try:
+                corrected_year = int(year_input)
+            except ValueError:
+                print("⚠️  Invalid year, ignoring.")
+        
+        # Search TMDB
+        print(f"\n🔍 Searching TMDB for '{corrected_title}'...")
+        
+        if media_type == 'movie':
+            results = self.tmdb.search_movie(corrected_title, corrected_year)
+        else:
+            results = self.tmdb.search_tv(corrected_title, corrected_year)
+            
+        if not results or not results.get('results'):
+            print("❌ No results found on TMDB")
+            self.safe_input("\nPress Enter to continue...")
+            return
+            
+        # Show search results
+        tmdb_results = results['results'][:10]  # Show top 10
+        print(f"\n📋 Found {len(tmdb_results)} results:")
+        
+        for i, result in enumerate(tmdb_results, 1):
+            if media_type == 'movie':
+                title = result.get('title', 'Unknown')
+                year = result.get('release_date', '')[:4] if result.get('release_date') else 'Unknown'
+                overview = result.get('overview', '')[:100] + ('...' if len(result.get('overview', '')) > 100 else '')
+            else:
+                title = result.get('name', 'Unknown')
+                year = result.get('first_air_date', '')[:4] if result.get('first_air_date') else 'Unknown'
+                overview = result.get('overview', '')[:100] + ('...' if len(result.get('overview', '')) > 100 else '')
+                
+            print(f"{i:2}. {title} ({year})")
+            if overview:
+                print(f"    {overview}")
+            print()
+            
+        # Let user choose
+        choice = self.safe_input("Select correct match (number), or press Enter to skip: ").strip()
+        if not choice:
+            return
+            
+        try:
+            choice_idx = int(choice) - 1
+            if 0 <= choice_idx < len(tmdb_results):
+                selected = tmdb_results[choice_idx]
+                self.apply_tmdb_correction(file_path, filename, corrected_title, corrected_year, media_type, selected)
+            else:
+                print("Invalid selection.")
+        except ValueError:
+            print("Invalid selection.")
+        
+    def apply_tmdb_correction(self, file_path, filename, corrected_title, corrected_year, media_type, tmdb_data):
+        """Apply TMDB correction to a file."""
+        if media_type == 'movie':
+            tmdb_title = tmdb_data.get('title', corrected_title)
+            tmdb_year = tmdb_data.get('release_date', '')[:4] if tmdb_data.get('release_date') else corrected_year
+            tmdb_id = tmdb_data.get('id')
+        else:
+            tmdb_title = tmdb_data.get('name', corrected_title)
+            tmdb_year = tmdb_data.get('first_air_date', '')[:4] if tmdb_data.get('first_air_date') else corrected_year
+            tmdb_id = tmdb_data.get('id')
+            
+        # Create new Plex-compliant filename
+        ext = os.path.splitext(filename)[1]
+        if media_type == 'movie':
+            new_filename = f"{tmdb_title} ({tmdb_year}){ext}"
+        else:
+            # For TV shows, keep original episode info but fix the show name
+            # This is simplified - could be enhanced for episode-specific renaming
+            new_filename = filename.replace(os.path.splitext(filename)[0], f"{tmdb_title} - Season 1")
+            
+        print(f"\n📝 Proposed correction:")
+        print(f"   Old: {filename}")
+        print(f"   New: {new_filename}")
+        print(f"   TMDB: {tmdb_title} ({tmdb_year}) [ID: {tmdb_id}]")
+        
+        apply = self.safe_input("\nApply this correction? (Y/n): ").lower() != 'n'
+        if not apply:
+            print("❌ Correction cancelled")
+            return
+            
+        # Store correction in database
+        with self.get_db_context() as conn:
+            cursor = conn.cursor()
+            cursor.execute('''
+                INSERT OR REPLACE INTO manual_corrections 
+                (original_file_path, original_filename, corrected_title, corrected_year, 
+                 media_type, tmdb_id, tmdb_title, tmdb_year, correction_date, applied)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ''', (file_path, filename, corrected_title, corrected_year, media_type, 
+                  tmdb_id, tmdb_title, int(tmdb_year) if tmdb_year.isdigit() else None, 
+                  time.time(), False))
+        
+        # Apply the correction (rename the file)
+        new_path = os.path.join(os.path.dirname(file_path), new_filename)
+        
+        if os.path.exists(new_path):
+            print(f"❌ File already exists: {new_filename}")
+            return
+            
+        try:
+            os.rename(file_path, new_path)
+            print(f"✅ Successfully renamed to: {new_filename}")
+            
+            # Mark as applied in database
+            with self.get_db_context() as conn:
+                cursor = conn.cursor()
+                cursor.execute('''
+                    UPDATE manual_corrections 
+                    SET applied = 1 
+                    WHERE original_file_path = ?
+                ''', (file_path,))
+                
+        except OSError as e:
+            print(f"❌ Error renaming file: {self.sanitize_error_message(str(e))}")
+        
     def find_duplicates(self):
         """Find duplicate video files."""
         print("\nDuplicate Detection Options:")
@@ -5121,30 +5722,31 @@ class MediaManager:
     
     def configure_folders(self):
         """Configure which folders to scan and their types."""
-        self.clear_screen()
-        print("📁 Folder Configuration")
-        print("="*60)
-        
-        with self.get_db_context() as conn:
-            cursor = conn.cursor()
-            cursor.execute('SELECT folder_path, folder_type, enabled FROM folder_config ORDER BY folder_type, folder_path')
-            current_folders = cursor.fetchall()
-        
-        if current_folders:
-            print("Current configured folders:")
-            for folder_path, folder_type, enabled in current_folders:
-                status = "✓" if enabled else "✗"
-                print(f"  {status} {folder_path} ({folder_type})")
-            print()
-        
-        print("Options:")
-        print("1. Add new folder")
-        print("2. Remove folder")
-        print("3. Enable/disable folder")
-        print("4. Reset to default (Movies & TV)")
-        print("0. Done")
-        
         while True:
+            self.clear_screen()
+            print("📁 Folder Configuration")
+            print("="*60)
+            
+            with self.get_db_context() as conn:
+                cursor = conn.cursor()
+                cursor.execute('SELECT folder_path, folder_type, enabled FROM folder_config ORDER BY folder_type, folder_path')
+                current_folders = cursor.fetchall()
+            
+            if current_folders:
+                print("Current configured folders:")
+                for folder_path, folder_type, enabled in current_folders:
+                    status = "✓" if enabled else "✗"
+                    folder_name = os.path.basename(folder_path)
+                    print(f"  {status} {folder_name} ({folder_type})")
+                print()
+            
+            print("Options:")
+            print("1. Add new folder")
+            print("2. Remove folder")
+            print("3. Enable/disable folder")
+            print("4. Reset to default (Movies & TV)")
+            print("0. Done")
+            
             choice = self.safe_input("\nEnter your choice: ")
             
             if choice == '0':
@@ -5159,6 +5761,7 @@ class MediaManager:
                 self.reset_default_folders()
             else:
                 print("Invalid choice.")
+                self.safe_input("Press Enter to continue...")
     
     def add_scan_folder(self):
         """Add a new folder to scan."""
@@ -6666,16 +7269,17 @@ class MediaManager:
             print("14. Smart Organization")
             print("15. Find Duplicate Videos")
             print("16. Quick Fixes")
+            print("17. Manual File Correction (TMDB Lookup) *requires free API key")
             print()
             print("🗑️  FILE MANAGEMENT:")
-            print("17. Delete TV show")
-            print("18. Delete video file")
+            print("18. Delete TV show")
+            print("19. Delete video file")
             print()
             print("☁️  BACKUP & SYNC:")
-            print("19. Backup & Sync (rclone)")
+            print("20. Backup & Sync (rclone)")
             print()
             print("⚙️  SETTINGS:")
-            print("20. Configure Scan Folders")
+            print("21. Configure Scan Folders")
             print()
             print("0. Exit")
             print()
@@ -6787,12 +7391,14 @@ class MediaManager:
                 elif choice == '16':
                     self.quick_fixes()
                 elif choice == '17':
-                    self.delete_show()
+                    self.manual_file_correction()
                 elif choice == '18':
-                    self.delete_video_file()
+                    self.delete_show()
                 elif choice == '19':
-                    self.backup_sync()
+                    self.delete_video_file()
                 elif choice == '20':
+                    self.backup_sync()
+                elif choice == '21':
                     self.configure_folders()
                 elif choice == '0':
                     print("\nGoodbye!")
@@ -7357,7 +7963,7 @@ class MediaManager:
         self.safe_input("\nPress Enter to continue...")
     
     def background_analysis(self):
-        """Comprehensive background analysis with progress tracking and caching."""
+        """Comprehensive background analysis with 3-phase workflow."""
         self.clear_screen()
         print("="*60)
         print("🔍 Background Analysis & Recommendations")
@@ -7403,13 +8009,42 @@ class MediaManager:
             cursor.execute('SELECT COUNT(*) FROM folder_config WHERE enabled = 1')
             configured_folders = cursor.fetchone()[0]
         
-        if configured_folders == 0:
-            print("\n⚠️  No folders configured for scanning")
-            print("Let's set up which folders to scan...")
+        # Handle folder configuration based on scan type and current state
+        if incremental_mode:
+            # Incremental scan - must have existing folders configured
+            if configured_folders == 0:
+                print("\n⚠️  Cannot perform incremental scan - no folders configured")
+                print("Please run a full analysis first to set up folder configuration.")
+                self.safe_input("Press Enter to continue...")
+                return
+            else:
+                print("\n📁 Using existing folder configuration:")
+                with self.get_db_context() as conn:
+                    cursor = conn.cursor()
+                    cursor.execute('SELECT folder_path, folder_type FROM folder_config WHERE enabled = 1 ORDER BY folder_type, folder_path')
+                    for folder_path, folder_type in cursor.fetchall():
+                        folder_name = os.path.basename(folder_path)
+                        print(f"   • {folder_name} ({folder_type})")
+                print()
+        else:
+            # Full scan - always prompt for folder configuration
+            if configured_folders > 0:
+                print("\n📁 Current folder configuration:")
+                with self.get_db_context() as conn:
+                    cursor = conn.cursor()
+                    cursor.execute('SELECT folder_path, folder_type FROM folder_config WHERE enabled = 1 ORDER BY folder_type, folder_path')
+                    for folder_path, folder_type in cursor.fetchall():
+                        folder_name = os.path.basename(folder_path)
+                        print(f"   • {folder_name} ({folder_type})")
+                print()
+            else:
+                print("\n⚠️  No folders configured for scanning")
+            
+            print("Let's configure which folders to scan...")
             self.safe_input("\nPress Enter to configure folders...")
             self.configure_folders()
             
-            # Check again after configuration
+            # Check final configuration
             with self.get_db_context() as conn:
                 cursor = conn.cursor()
                 cursor.execute('SELECT COUNT(*) FROM folder_config WHERE enabled = 1')
@@ -7420,16 +8055,325 @@ class MediaManager:
                 self.safe_input("Press Enter to continue...")
                 return
         
+        # Ask about fix options upfront for full scans
+        fix_naming = False
+        fix_transcoding = False
+        optimize_streaming = False
+        fix_subtitles = False
+        auto_remove_system = False
+        check_corruption = False
+        
+        if not incremental_mode:
+            print("\n🔧 What would you like to fix during this full scan?")
+            fix_naming = self.safe_input("Fix files with bad names (spaces, periods, TV format)? (Y/n): ").lower() != 'n'
+            fix_transcoding = self.safe_input("Transcode videos larger than 1080p? (y/N): ").lower() == 'y'
+            optimize_streaming = self.safe_input("Optimize videos for streaming (convert AVI/FLV/WMV/MOV to MP4)? (y/N): ").lower() == 'y'
+            fix_subtitles = self.safe_input("Download missing subtitles? (y/N): ").lower() == 'y'
+            auto_remove_system = self.safe_input("Auto-remove system files (.DS_Store, etc.)? (y/N): ").lower() == 'y'
+            check_corruption = self.safe_input("Check for corrupted video files? (y/N): ").lower() == 'y'
+        
         print("\n" + "="*60)
         print("🚀 Starting Background Analysis...")
         print("="*60)
-        
+
         start_time = time.time()
         
-        # Initialize analysis results with real-time issue tracking
+        # PHASE 1: INDEX ALL FILES AND ADD TO DATABASE
+        print("Phase 1: Indexing all files and adding to database...")
+        all_video_files = self.index_all_files(incremental_mode)
+        
+        if not all_video_files:
+            print("No files found to process.")
+            self.safe_input("Press Enter to continue...")
+            return
+        
+        # PHASE 2: RUN RENAMING ON FILES THAT NEED IT
+        if not incremental_mode and fix_naming:  # Only if user requested naming fixes
+            naming_issues_count = self.run_renaming_phase(all_video_files, fix_naming)
+            if naming_issues_count > 0:
+                print(f"\n✓ Phase 2 complete: Fixed {naming_issues_count} naming issues")
+                # Refresh file list after renaming
+                all_video_files = self.index_all_files(incremental_mode=False)
+        elif not incremental_mode:
+            print("\nPhase 2: Skipping rename (not requested)")
+        
+        # PHASE 3: ANALYZE AND OFFER OTHER FIXES
+        analysis_results = self.run_analysis_phase(all_video_files, incremental_mode, 
+                                                 fix_transcoding, optimize_streaming, 
+                                                 fix_subtitles, auto_remove_system, check_corruption)
+        
+        # Save analysis session and display results
+        analysis_duration = time.time() - start_time
+        self.save_analysis_session(
+            len(all_video_files), 
+            len(analysis_results.get('conversion_candidates', [])),
+            analysis_duration,
+            analysis_results.get('recommendations', [])
+        )
+        
+        # Display results using the new clean display function
+        self.display_final_analysis_results(analysis_results, len(all_video_files), len(all_video_files))
+        
+        # Execute the requested fixes
+        if not incremental_mode and (fix_transcoding or optimize_streaming or fix_subtitles or auto_remove_system):
+            print(f"\n{'='*60}")
+            print("🔨 Executing Requested Fixes")
+            print(f"{'='*60}")
+            self.execute_analysis_fixes(analysis_results, fix_transcoding, optimize_streaming, fix_subtitles, auto_remove_system)
+    
+    def execute_analysis_fixes(self, analysis_results, fix_transcoding, optimize_streaming, fix_subtitles, auto_remove_system):
+        """Execute the fixes that the user requested during analysis."""
+        total_tasks = 0
+        
+        # Count total tasks
+        if fix_transcoding and analysis_results['conversion_candidates']:
+            total_tasks += len(analysis_results['conversion_candidates'])
+        if optimize_streaming and analysis_results['codec_issues']:
+            total_tasks += len(analysis_results['codec_issues'])
+        if fix_subtitles and analysis_results['missing_subtitles']:
+            total_tasks += len(analysis_results['missing_subtitles'])
+        if auto_remove_system and analysis_results['system_files']:
+            total_tasks += len(analysis_results['system_files'])
+            
+        if total_tasks == 0:
+            print("\nNo fixes needed based on analysis!")
+            self.safe_input("\nPress Enter to continue...")
+            return
+            
+        print(f"\n📋 Total tasks to execute: {total_tasks}")
+        confirm = self.safe_input("\nProceed with all fixes? (Y/n): ")
+        if confirm.lower() == 'n':
+            print("Fixes cancelled.")
+            self.safe_input("\nPress Enter to continue...")
+            return
+            
+        completed_tasks = 0
+        
+        # Execute transcoding tasks
+        if fix_transcoding and analysis_results['conversion_candidates']:
+            print(f"\n🎥 Converting {len(analysis_results['conversion_candidates'])} videos to 1080p...")
+            for i, video in enumerate(analysis_results['conversion_candidates'], 1):
+                print(f"\rConverting {i}/{len(analysis_results['conversion_candidates'])}: {os.path.basename(video['path'])}", end='', flush=True)
+                result = self.transcode_video_task(video['path'])
+                if "successfully" in result.lower():
+                    completed_tasks += 1
+            print()
+        
+        # Execute streaming optimization
+        if optimize_streaming and analysis_results['codec_issues']:
+            print(f"\n📹 Optimizing {len(analysis_results['codec_issues'])} videos for streaming...")
+            for i, video in enumerate(analysis_results['codec_issues'], 1):
+                print(f"\rOptimizing {i}/{len(analysis_results['codec_issues'])}: {os.path.basename(video['path'])}", end='', flush=True)
+                # Reuse transcode task but with streaming-optimized settings
+                result = self.transcode_video_task(video['path'])
+                if "successfully" in result.lower():
+                    completed_tasks += 1
+            print()
+        
+        # Download subtitles
+        if fix_subtitles and analysis_results['missing_subtitles']:
+            print(f"\n📝 Downloading subtitles for {len(analysis_results['missing_subtitles'])} videos...")
+            for i, file_path in enumerate(analysis_results['missing_subtitles'], 1):
+                print(f"\rDownloading subtitles {i}/{len(analysis_results['missing_subtitles'])}: {os.path.basename(file_path)}", end='', flush=True)
+                result = self.download_subtitle_task(file_path)
+                if "downloaded" in result.lower():
+                    completed_tasks += 1
+            print()
+        
+        # Remove system files
+        if auto_remove_system and analysis_results['system_files']:
+            print(f"\n🗑️  Removing {len(analysis_results['system_files'])} system files...")
+            for i, file_path in enumerate(analysis_results['system_files'], 1):
+                print(f"\rRemoving {i}/{len(analysis_results['system_files'])}: {os.path.basename(file_path)}", end='', flush=True)
+                result = self.remove_system_file_task(file_path)
+                if "successfully" in result.lower():
+                    completed_tasks += 1
+            print()
+            
+        print(f"\n✅ Completed {completed_tasks}/{total_tasks} tasks!")
+        self.safe_input("\nPress Enter to continue...")
+    
+    def index_all_files(self, incremental_mode):
+        """Phase 1: Index all files and add basic info to database."""
+        all_video_files = []
+        discovered_count = 0
+        
+        # Get configured folders to scan
+        with self.get_db_context() as conn:
+            cursor = conn.cursor()
+            cursor.execute('SELECT folder_path FROM folder_config WHERE enabled = 1')
+            folders_to_scan = [row[0] for row in cursor.fetchall()]
+        
+        if not folders_to_scan:
+            print("❌ No folders configured for scanning!")
+            return []
+        
+        # For incremental mode, show comparison with existing scan
+        if incremental_mode:
+            with self.get_db_context() as conn:
+                cursor = conn.cursor()
+                cursor.execute('SELECT MAX(last_scanned) FROM video_files')
+                last_scan_time = cursor.fetchone()[0]
+                if last_scan_time:
+                    last_scan_date = datetime.fromtimestamp(last_scan_time).strftime('%Y-%m-%d %H:%M')
+                    print(f"📋 Using scan data from {last_scan_date}")
+                    print("🔍 Comparing with current filesystem to find new/changed files...")
+                else:
+                    print("📋 No previous scan data found, performing full scan...")
+        
+        # Scan configured folders and collect all video files
+        for folder_path in folders_to_scan:
+            if not os.path.exists(folder_path):
+                print(f"⚠️  Folder not found: {folder_path}")
+                continue
+                
+            for root, dirs, files in os.walk(folder_path, followlinks=False):
+                for file in files:
+                    if file.lower().endswith(self.video_extensions):
+                        file_path = os.path.join(root, file)
+                        all_video_files.append(file_path)
+                        discovered_count += 1
+                        
+                        # Show discovery progress every 100 files
+                        if discovered_count % 100 == 0:
+                            if incremental_mode:
+                                print(f"\r🔍 Scanning filesystem... Found {discovered_count} files", end='', flush=True)
+                            else:
+                                print(f"\r🔍 Indexing files... Found {discovered_count} so far", end='', flush=True)
+        
+        if incremental_mode:
+            # Count how many files are new/changed
+            new_or_changed = []
+            cached_count = 0
+            
+            for file_path in all_video_files:
+                if self.is_file_changed(file_path):
+                    new_or_changed.append(file_path)
+                else:
+                    cached_count += 1
+            
+            print(f"\n📊 Comparison complete:")
+            print(f"   • Total files found: {discovered_count}")
+            print(f"   • Using cached data: {cached_count}")
+            print(f"   • New or changed: {len(new_or_changed)}")
+            
+            if len(new_or_changed) == 0:
+                print("✅ No new or changed files found!")
+                return all_video_files
+            
+            print(f"\n📥 Processing {len(new_or_changed)} new/changed files...")
+            files_to_process = new_or_changed
+        else:
+            print(f"\n✓ Found {discovered_count} video files")
+            files_to_process = all_video_files
+        
+        # Add/update file info in database
+        batch_to_save = []
+        for i, file_path in enumerate(files_to_process):
+            if i % 100 == 0 and i > 0:
+                print(f"\r📊 Adding to database... {i}/{len(files_to_process)}", end='', flush=True)
+                
+            try:
+                stat = os.stat(file_path)
+                file_data = {
+                    'file_path': file_path,
+                    'relative_path': os.path.relpath(file_path, self.base_path),
+                    'filename': os.path.basename(file_path),
+                    'file_size': stat.st_size,
+                    'file_modified': stat.st_mtime,
+                    'last_scanned': time.time()
+                }
+                batch_to_save.append(file_data)
+                
+                # Save in batches of 100
+                if len(batch_to_save) >= 100:
+                    self.save_video_metadata_batch(batch_to_save)
+                    batch_to_save = []
+                    
+            except OSError:
+                continue
+        
+        # Save any remaining files
+        if batch_to_save:
+            self.save_video_metadata_batch(batch_to_save)
+        
+        if incremental_mode:
+            print(f"\n✓ Phase 1 complete: Updated {len(files_to_process)} files in database")
+        else:
+            print(f"\n✓ Phase 1 complete: Indexed {discovered_count} files")
+        return all_video_files
+    
+    def run_renaming_phase(self, all_video_files, fix_naming=True):
+        """Phase 2: Check for naming issues and fix them all at once."""
+        print("\nPhase 2: Analyzing naming issues and running auto-rename...")
+        
+        naming_issues = []
+        
+        # Check all files for naming issues
+        for file_path in all_video_files:
+            issues = self.check_naming_issues(file_path)
+            if issues:
+                naming_issues.append({'path': file_path, 'issues': issues})
+        
+        if not naming_issues:
+            print("✓ No naming issues found")
+            return 0
+        
+        print(f"Found {len(naming_issues)} files with naming issues")
+        
+        if not fix_naming:
+            print("Skipping naming fixes")
+            return 0
+        
+        # Run renaming on all files with issues
+        renamed_count = 0
+        rename_updates = []  # Store database updates for batching
+        
+        for i, issue_data in enumerate(naming_issues, 1):
+            file_path = issue_data['path']
+            print(f"\rRenaming {i}/{len(naming_issues)}: {os.path.basename(file_path)}", end='', flush=True)
+            
+            rename_result = self.rename_file_task_no_db(file_path)
+            if rename_result and rename_result.get('success'):
+                renamed_count += 1
+                rename_updates.append((
+                    rename_result['new_path'], 
+                    rename_result['new_filename'], 
+                    file_path
+                ))
+        
+        # Batch update database
+        if rename_updates:
+            print(f"\n📊 Updating database for {len(rename_updates)} renamed files...")
+            with self.get_db_context() as conn:
+                cursor = conn.cursor()
+                cursor.executemany(
+                    'UPDATE video_files SET file_path = ?, filename = ? WHERE file_path = ?',
+                    rename_updates
+                )
+        
+        print(f"\n✓ Renamed {renamed_count} files")
+        return renamed_count
+    
+    def run_analysis_phase(self, all_video_files, incremental_mode, fix_transcoding=False, optimize_streaming=False, fix_subtitles=False, auto_remove_system=False, check_corruption=False):
+        """Phase 3: Analyze files for other issues and offer fixes."""
+        print("\nPhase 3: Analyzing video properties and generating recommendations...")
+        
+        if incremental_mode:
+            # For incremental, get count of cached vs new files
+            new_files = [f for f in all_video_files if self.is_file_changed(f)]
+            cached_files = len(all_video_files) - len(new_files)
+            
+            if cached_files > 0:
+                print(f"📋 Loading analysis for {cached_files} files from database cache")
+            if new_files:
+                print(f"🔍 Will analyze {len(new_files)} new/changed files")
+        
+        
+        # Initialize analysis results
         analysis_results = {
-            'files_scanned': 0,
-            'total_files': 0,
+            'files_scanned': len(all_video_files),
+            'total_files': len(all_video_files),
             'conversion_candidates': [],
             'naming_issues': [],
             'missing_subtitles': [],
@@ -7443,518 +8387,208 @@ class MediaManager:
             'background_tasks': []
         }
         
-        # Real-time issue discovery tracking
-        found_issues = {
-            'subtitle_issues': [],
-            'system_files_found': [],
-            'naming_problems': [],
-            'codec_problems': [],
-            'corrupted_files': [],
-            'background_tasks': []
-        }
-        
-        # Ask about fix options upfront
-        print("\n🔧 What would you like to fix during this scan?")
-        fix_naming = self.safe_input("Fix files with bad names (spaces, periods, TV format)? (y/N): ").lower() == 'y'
-        fix_transcoding = self.safe_input("Transcode videos larger than 1080p? (y/N): ").lower() == 'y'
-        optimize_streaming = self.safe_input("Optimize videos for streaming (convert AVI/FLV/WMV/MOV to MP4)? (y/N): ").lower() == 'y'
-        fix_subtitles = self.safe_input("Download missing subtitles? (y/N): ").lower() == 'y'
-        auto_remove_system = self.safe_input("Auto-remove system files (.DS_Store, etc.)? (y/N): ").lower() == 'y'
-        check_corruption = self.safe_input("Check for corrupted video files? (y/N): ").lower() == 'y'
-        
-        # Progress tracking variables
-        progress = {
-            'file_scan': {'current': 0, 'total': 0, 'complete': False},
-            'resolution_analysis': {'current': 0, 'total': 0, 'complete': False},
-            'subtitle_check': {'current': 0, 'total': 0, 'complete': False},
-            'naming_analysis': {'current': 0, 'total': 0, 'complete': False},
-            'codec_analysis': {'current': 0, 'total': 0, 'complete': False},
-            'corruption_check': {'current': 0, 'total': 0, 'complete': False}
-        }
-        
-        if not check_corruption:
-            with self._progress_lock:
-                progress['corruption_check']['complete'] = True
-        
-        def update_progress_display():
-            """Update progress bars with real-time issue discovery."""
-            while True:
-                with self._progress_lock:
-                    all_complete = all(p['complete'] for p in progress.values())
-                    if all_complete:
-                        break
-                    
-                    progress_copy = {}
-                    for task, data in progress.items():
-                        progress_copy[task] = data.copy()
-                
-                print("\033[2J\033[H")  # Clear screen and go to top
-                print("="*60)
-                print("🔍 Background Analysis in Progress...")
-                print("="*60)
-                
-                # Progress bars
-                for task, data in progress_copy.items():
-                    if data['total'] > 0:
-                        pct = (data['current'] / data['total']) * 100
-                        filled = int(pct / 2)
-                        bar = "█" * filled + "░" * (50 - filled)
-                        status = "✓" if data['complete'] else "⏳"
-                        task_name = task.replace('_', ' ').title()
-                        print(f"{status} {task_name:<20} [{bar}] {pct:5.1f}% ({data['current']}/{data['total']})")
-                    else:
-                        task_name = task.replace('_', ' ').title()
-                        print(f"⏳ {task_name:<20} [{'░' * 50}]   0.0% (0/0)")
-                
-                # Real-time issue discovery
-                if any(found_issues.values()):
-                    print("\n🚨 ISSUES FOUND:")
-                    
-                    if found_issues['subtitle_issues']:
-                        recent_subs = found_issues['subtitle_issues'][-3:]  # Show last 3
-                        for issue in recent_subs:
-                            print(f"   📝 {issue}")
-                        if len(found_issues['subtitle_issues']) > 3:
-                            print(f"   ... and {len(found_issues['subtitle_issues']) - 3} more")
-                    
-                    if found_issues['system_files_found']:
-                        print(f"   🗑️  System files: {len(found_issues['system_files_found'])}")
-                    
-                    if found_issues['naming_problems']:
-                        recent_naming = found_issues['naming_problems'][-2:]
-                        for issue in recent_naming:
-                            print(f"   📂 {issue}")
-                    
-                    if found_issues['codec_problems']:
-                        print(f"   🎬 Old codecs: {len(found_issues['codec_problems'])}")
-                    
-                    if found_issues['corrupted_files']:
-                        recent_corrupt = found_issues['corrupted_files'][-2:]
-                        for issue in recent_corrupt:
-                            print(f"   💥 {issue}")
-                
-                # Active background tasks
-                if self.active_tasks:
-                    print(f"\n⚡ ACTIVE TASKS ({len(self.active_tasks)}/{self.max_concurrent_tasks}):")
-                    for task_id, task in self.active_tasks.items():
-                        elapsed = time.time() - task['started_at']
-                        print(f"   🔧 Task {task_id}: {task['description']} ({elapsed:.1f}s)")
-                
-                # Completed tasks (show last few)
-                if found_issues['background_tasks']:
-                    recent_completed = found_issues['background_tasks'][-3:]
-                    print(f"\n✅ COMPLETED TASKS:")
-                    for task_result in recent_completed:
-                        print(f"   {task_result}")
-                
-                time.sleep(0.5 + secrets.SystemRandom().uniform(0, 0.1))  # Cryptographically secure jitter
-        
-        # Start progress display in background thread
-        progress_thread = threading.Thread(target=update_progress_display, daemon=True)
-        progress_thread.start()
-        
-        # Phase 1: Initial file scan with real-time discovery progress
-        if incremental_mode:
-            print("Phase 1: Scanning for new/changed files...")
-        else:
-            print("Phase 1: Creating index of files...")
-            
-        all_video_files = []
-        files_to_analyze = []
-        discovered_count = 0
-        
-        for root, dirs, files in os.walk(self.base_path, followlinks=False):
-            for file in files:
-                if file.lower().endswith(self.video_extensions):
-                    file_path = os.path.join(root, file)
-                    all_video_files.append(file_path)
-                    discovered_count += 1
-                    
-                    # Show discovery progress every 100 files
-                    if discovered_count % 100 == 0:
-                        print(f"\r🔍 Creating index of files... Found {discovered_count} so far", end='', flush=True)
-                    
-                    # Check if file needs analysis
-                    if not incremental_mode or self.is_file_changed(file_path):
-                        files_to_analyze.append(file_path)
-        
-        print(f"\n✓ Found {discovered_count} video files ({len(files_to_analyze)} to analyze)")
-        
-        with self._progress_lock:
-            progress['file_scan']['total'] = discovered_count
-            progress['file_scan']['current'] = discovered_count
-            progress['file_scan']['complete'] = True
-        analysis_results['total_files'] = discovered_count
-        
-        if incremental_mode:
-            print(f"Found {len(files_to_analyze)} new/changed files out of {discovered_count} total")
-        else:
-            files_to_analyze = all_video_files
-        
-        for i, file_path in enumerate(all_video_files):
-            with self._progress_lock:
-                progress['file_scan']['current'] = i + 1
-            analysis_results['files_scanned'] = i + 1
-            time.sleep(0.001 + secrets.SystemRandom().uniform(0, 0.0005))  # Cryptographically secure jitter
-        
-        with self._progress_lock:
-            progress['file_scan']['complete'] = True
-        
-        # Phase 2: Load cached data and analyze new/changed files
-        with self._progress_lock:
-            progress['resolution_analysis']['total'] = len(files_to_analyze)
-            progress['codec_analysis']['total'] = len(files_to_analyze)
-        
-        # Load existing data from database for unchanged files
+        # For incremental mode, load cached analysis data for unchanged files
         if incremental_mode:
             with self.get_db_context() as conn:
                 cursor = conn.cursor()
                 
-                # Get cached data for unchanged files
-                unchanged_files = [f for f in all_video_files if f not in files_to_analyze]
-                for file_path in unchanged_files:
-                    # Validate file path before database query
-                    if not self.validate_safe_path(file_path):
-                        continue
-                    cursor.execute('SELECT * FROM video_files WHERE file_path = ?', (file_path,))
-                    row = cursor.fetchone()
-                    if row:
-                        # Add to results from cache
-                        if row['needs_conversion']:
-                            analysis_results['conversion_candidates'].append({
-                                'path': file_path,
-                                'width': row['width'],
-                                'height': row['height'], 
-                                'size_gb': row['file_size'] / (1024**3),
-                                'codec': row['codec']
-                            })
-                        
-                        if row['codec'] in ['mpeg4', 'xvid', 'divx', 'wmv3']:
-                            analysis_results['codec_issues'].append({
-                                'path': file_path,
-                                'codec': row['codec']
-                            })
-                        
-                        if row['file_size'] / (1024**3) > 10:
-                            analysis_results['large_files'].append({
-                                'path': file_path,
-                                'size_gb': row['file_size'] / (1024**3),
-                                'resolution': f"{row['width']}x{row['height']}"
-                            })
-                        
-                        if row['naming_issues']:
-                            analysis_results['naming_issues'].append({
-                                'path': file_path,
-                                'issues': row['naming_issues'].split(',')
-                            })
-                        
-                        if not row['has_external_subs'] and not row['has_embedded_subs']:
-                            analysis_results['missing_subtitles'].append(file_path)
-        
-        # Analyze files in batches with immediate database saves
-        batch_to_save = []  # Collect files to save in batches
-        batch_number = 0
-        
-        print(f"\n🔍 Analyzing {len(files_to_analyze)} files in batches of 100...")
-        
-        for i, file_path in enumerate(files_to_analyze):
-            # Show batch progress
-            if i % 100 == 0:
-                batch_number = i // 100 + 1
-                print(f"\r📊 Working on batch {batch_number} (files {i+1}-{min(i+100, len(files_to_analyze))} of {len(files_to_analyze)})", end='', flush=True)
-            
-            with self._progress_lock:
-                progress['resolution_analysis']['current'] = i + 1
-                progress['codec_analysis']['current'] = i + 1
-            
-            try:
-                # Get file stats
-                stat = os.stat(file_path)
-                file_data = {
-                    'file_path': file_path,
-                    'relative_path': os.path.relpath(file_path, self.base_path),
-                    'filename': os.path.basename(file_path),
-                    'file_size': stat.st_size,
-                    'file_modified': stat.st_mtime,
-                    'naming_issues': []
-                }
+                # Load cached analysis data for all files from database
+                unchanged_files = [f for f in all_video_files if not self.is_file_changed(f)]
                 
-                # Get video info
-                video_info = self.get_video_info(file_path)
-                if video_info:
-                    for stream in video_info.get('streams', []):
-                        if stream.get('codec_type') == 'video':
-                            width = stream.get('width', 0)
-                            height = stream.get('height', 0)
-                            codec = self.validate_codec_name(stream.get('codec_name', 'unknown'))
-                            duration = float(stream.get('duration', 0))
-                            bitrate = int(stream.get('bit_rate', 0)) if stream.get('bit_rate') else None
-                            
-                            file_data.update({
-                                'width': width,
-                                'height': height,
-                                'codec': codec,
-                                'duration': duration,
-                                'bitrate': bitrate
-                            })
-                            
-                            # Check if needs conversion
-                            if width > 1920 or height > 1080:
-                                size_gb = stat.st_size / (1024**3)
-                                file_data['needs_conversion'] = True
-                                file_data['conversion_reason'] = f"Resolution {width}x{height} > 1080p"
-                                
+                if unchanged_files:
+                    print(f"📋 Loading cached analysis for {len(unchanged_files)} unchanged files...")
+                    
+                    for file_path in unchanged_files:
+                        if not self.validate_safe_path(file_path):
+                            continue
+                        cursor.execute('SELECT * FROM video_files WHERE file_path = ?', (file_path,))
+                        row = cursor.fetchone()
+                        if row:
+                            # Add cached data to results
+                            if row['needs_conversion']:
                                 analysis_results['conversion_candidates'].append({
                                     'path': file_path,
-                                    'width': width,
-                                    'height': height,
-                                    'size_gb': size_gb,
-                                    'codec': codec
+                                    'width': row['width'],
+                                    'height': row['height'], 
+                                    'size_gb': row['file_size'] / (1024**3),
+                                    'codec': row['codec']
                                 })
-                                
-                                # Queue for transcoding (but only after renaming if needed)
-                                # This will be queued later after rename tasks complete
                             
-                            # Check codec issues
-                            if codec in ['mpeg4', 'xvid', 'divx', 'wmv3']:
+                            if row['codec'] in ['mpeg4', 'xvid', 'divx', 'wmv3']:
                                 analysis_results['codec_issues'].append({
                                     'path': file_path,
-                                    'codec': codec
+                                    'codec': row['codec']
                                 })
                             
-                            # Check container format for streaming optimization
-                            file_extension = os.path.splitext(file_path)[1].lower()
-                            problematic_containers = ['.avi', '.flv', '.wmv', '.mov', '.mkv']
-                            if file_extension in problematic_containers:
-                                analysis_results.setdefault('container_issues', []).append({
-                                    'path': file_path,
-                                    'container': file_extension,
-                                    'codec': codec,
-                                    'size_gb': stat.st_size / (1024**3)
-                                })
-                            
-                            # Check large files
-                            size_gb = stat.st_size / (1024**3)
-                            if size_gb > 10:
+                            if row['file_size'] / (1024**3) > 10:
                                 analysis_results['large_files'].append({
                                     'path': file_path,
-                                    'size_gb': size_gb,
-                                    'resolution': f"{width}x{height}"
+                                    'size_gb': row['file_size'] / (1024**3),
+                                    'resolution': f"{row['width']}x{row['height']}"
                                 })
-                            break
+                            
+                            if row['naming_issues']:
+                                analysis_results['naming_issues'].append({
+                                    'path': file_path,
+                                    'issues': row['naming_issues'].split(',')
+                                })
+                            
+                            if not row['has_external_subs'] and not row['has_embedded_subs']:
+                                analysis_results['missing_subtitles'].append(file_path)
+        
+        # Analyze files for issues (but don't fix naming since that was done in Phase 2)
+        files_to_analyze = all_video_files if not incremental_mode else [f for f in all_video_files if self.is_file_changed(f)]
+        
+        for i, file_path in enumerate(files_to_analyze):
+            if i % 100 == 0:
+                print(f"\r📊 Analyzing properties... {i}/{len(files_to_analyze)}", end='', flush=True)
                 
-                # Analyze naming issues
-                filename = os.path.basename(file_path)
-                issues = []
-                
-                if '  ' in filename:
-                    issues.append('Double spaces')
-                if '..' in filename:
-                    issues.append('Double periods')
-                if filename.count('.') > 2:
-                    issues.append('Too many periods')
-                if any(char in filename for char in ['[', ']', '{', '}', '(', ')']):
-                    if not any(pattern in filename.lower() for pattern in ['1080p', '720p', '4k', 'x264', 'x265']):
-                        issues.append('Unnecessary brackets')
-                
-                # Check Plex naming compliance
-                relative_path = os.path.relpath(file_path, self.base_path)
-                if '/TV/' in relative_path:
-                    if not (' - S' in filename and 'E' in filename):
-                        issues.append('Non-Plex TV format')
-                elif '/Movies/' in relative_path:
-                    if not ('(' in filename and ')' in filename):
-                        issues.append('Missing year in movie title')
-                
-                # Fix naming issues immediately if user requested it
-                if fix_naming and issues:
-                    rename_result = self.rename_file_task(file_path)
-                    if "Renamed to:" in rename_result:
-                        # Update file_path to new path for subsequent processing
-                        directory = os.path.dirname(file_path)
-                        old_filename = os.path.basename(file_path)
-                        new_filename = rename_result.replace("Renamed to: ", "")
-                        new_file_path = os.path.join(directory, new_filename)
+            # Analyze file properties and add to appropriate lists
+            self.analyze_single_file_properties(file_path, analysis_results, 
+                                              fix_transcoding, optimize_streaming, 
+                                              fix_subtitles, auto_remove_system, check_corruption)
+        
+        print(f"\n✓ Phase 3 complete: Analyzed {len(files_to_analyze)} files")
+        
+        # Generate recommendations and display results
+        self.generate_recommendations(analysis_results)
+        self.display_final_analysis_results(analysis_results, len(all_video_files), len(files_to_analyze))
+        
+        return analysis_results
+    
+    def check_naming_issues(self, file_path):
+        """Check a single file for naming issues."""
+        filename = os.path.basename(file_path)
+        relative_path = os.path.relpath(file_path, self.base_path)
+        issues = []
+        
+        # Check for common naming problems
+        if ' ' in filename or '.' in filename.replace(os.path.splitext(filename)[1], ''):
+            issues.append('Contains spaces or periods')
+        
+        # Check for TV show format issues
+        if '/TV/' in relative_path:
+            # Check for season/episode format
+            import re
+            if not re.search(r'[Ss]\d{1,2}[Ee]\d{1,2}', filename):
+                issues.append('Missing S##E## TV format')
+        
+        # Check for movie year format
+        elif '/Movies/' in relative_path:
+            if not ('(' in filename and ')' in filename):
+                issues.append('Missing year in movie title')
+        
+        return issues
+    
+    def check_subtitle_status(self, file_path):
+        """Check if a file has external or embedded English subtitles."""
+        # Check for external subtitle files
+        base_name = os.path.splitext(file_path)[0]
+        subtitle_files = [f"{base_name}.srt", f"{base_name}.en.srt", f"{base_name}.eng.srt", f"{base_name}.vtt", f"{base_name}.en.vtt"]
+        has_external_subs = any(os.path.exists(sub_file) for sub_file in subtitle_files)
+        
+        # Check for embedded subtitles
+        has_embedded_subs = False
+        video_info = self.get_video_info(file_path)
+        if video_info:
+            for stream in video_info.get('streams', []):
+                if stream.get('codec_type') == 'subtitle':
+                    tags = stream.get('tags', {})
+                    language = tags.get('language', '').lower()
+                    if language in ['en', 'eng', 'english'] or not language:
+                        has_embedded_subs = True
+                        break
+        
+        return has_external_subs, has_embedded_subs
+    
+    def analyze_single_file_properties(self, file_path, analysis_results, fix_transcoding, optimize_streaming, fix_subtitles, auto_remove_system, check_corruption):
+        """Analyze a single file's properties and add to appropriate result lists."""
+        try:
+            stat = os.stat(file_path)
+            
+            # Get video info for detailed analysis
+            video_info = self.get_video_info(file_path)
+            if video_info:
+                for stream in video_info.get('streams', []):
+                    if stream.get('codec_type') == 'video':
+                        width = stream.get('width', 0)
+                        height = stream.get('height', 0)
+                        codec = self.validate_codec_name(stream.get('codec_name', 'unknown'))
                         
-                        file_path = new_file_path  # Update for rest of processing
-                        file_data['file_path'] = new_file_path
-                        file_data['filename'] = new_filename
-                        file_data['naming_issues'] = []  # Clear since fixed
+                        # Check if needs conversion
+                        if fix_transcoding and (width > 1920 or height > 1080):
+                            size_gb = stat.st_size / (1024**3)
+                            analysis_results['conversion_candidates'].append({
+                                'path': file_path,
+                                'width': width,
+                                'height': height,
+                                'size_gb': size_gb,
+                                'codec': codec
+                            })
                         
-                        found_issues['naming_problems'].append(f"{old_filename} → {new_filename} ✓ FIXED")
-                    else:
-                        file_data['naming_issues'] = issues
-                        found_issues['naming_problems'].append(f"{os.path.basename(file_path)}: {', '.join(issues[:2])}")
-                        analysis_results['naming_issues'].append({
-                            'path': file_path,
-                            'issues': issues
-                        })
-                else:
-                    file_data['naming_issues'] = issues
-                    if issues:
-                        analysis_results['naming_issues'].append({
-                            'path': file_path,
-                            'issues': issues
-                        })
-                
-                # Check subtitles
-                base_name = os.path.splitext(file_path)[0]
-                subtitle_files = [f"{base_name}.srt", f"{base_name}.en.srt", f"{base_name}.eng.srt"]
-                has_external_subs = any(os.path.exists(sub_file) for sub_file in subtitle_files)
-                
-                has_embedded_subs = False
-                if video_info:
-                    for stream in video_info.get('streams', []):
-                        if stream.get('codec_type') == 'subtitle':
-                            tags = stream.get('tags', {})
-                            language = tags.get('language', '').lower()
-                            if language in ['en', 'eng', 'english'] or not language:
-                                has_embedded_subs = True
-                                break
-                
-                file_data['has_external_subs'] = has_external_subs
-                file_data['has_embedded_subs'] = has_embedded_subs
-                
-                if not has_external_subs and not has_embedded_subs:
-                    analysis_results['missing_subtitles'].append(file_path)
-                    found_issues['subtitle_issues'].append(f"Missing subtitles: {os.path.basename(file_path)}")
-                
-                # Check for naming issues and report
-                if issues:
-                    issue_desc = f"{os.path.basename(file_path)}: {', '.join(issues[:2])}"
-                    found_issues['naming_problems'].append(issue_desc)
-                
-                # Report codec issues
-                if file_data.get('codec') in ['mpeg4', 'xvid', 'divx', 'wmv3']:
-                    found_issues['codec_problems'].append(f"{os.path.basename(file_path)}: {file_data['codec']}")
-                
-                # Add to batch instead of saving individually
-                batch_to_save.append(file_data)
-                
-                # Save batch periodically to avoid memory issues
-                if len(batch_to_save) >= 100:
-                    self.save_video_metadata_batch(batch_to_save)
-                    batch_to_save = []
-                
-            except (OSError, IOError, ValueError, subprocess.SubprocessError) as e:
-                print(f"Error analyzing {file_path}: {self.sanitize_error_message(str(e))}")
-                continue
+                        # Check codec issues
+                        if codec in ['mpeg4', 'xvid', 'divx', 'wmv3']:
+                            analysis_results['codec_issues'].append({
+                                'path': file_path,
+                                'codec': codec
+                            })
+                        
+                        # Check container format for streaming optimization
+                        if optimize_streaming:
+                            file_extension = os.path.splitext(file_path)[1].lower()
+                            problematic_containers = ['.avi', '.flv', '.wmv', '.mov']
+                            if file_extension in problematic_containers:
+                                analysis_results['codec_issues'].append({
+                                    'path': file_path,
+                                    'codec': f"{codec} ({file_extension})"
+                                })
+                        
+                        # Update database with analysis
+                        file_data = {
+                            'file_path': file_path,
+                            'width': width,
+                            'height': height,
+                            'codec': codec,
+                            'file_size': stat.st_size,
+                            'file_modified': stat.st_mtime,
+                            'needs_conversion': (width > 1920 or height > 1080),
+                            'last_scanned': time.time()
+                        }
+                        
+                        # Check subtitles if requested
+                        if fix_subtitles:
+                            has_external, has_embedded = self.check_subtitle_status(file_path)
+                            file_data['has_external_subs'] = has_external
+                            file_data['has_embedded_subs'] = has_embedded
+                            
+                            if not has_external and not has_embedded:
+                                analysis_results['missing_subtitles'].append(file_path)
+                        
+                        # Save file data to database
+                        self.save_video_metadata_batch([file_data])
+                        break
             
-            time.sleep(0.001 + secrets.SystemRandom().uniform(0, 0.0005))  # Cryptographically secure jitter
-        
-        # Save any remaining files in the batch
-        if batch_to_save:
-            self.save_video_metadata_batch(batch_to_save)
-        
-        # Queue rename tasks if user requested them
-        if fix_naming and analysis_results['naming_issues']:
-            print(f"\n📝 Queueing {len(analysis_results['naming_issues'])} rename tasks...")
-            rename_tasks = []
-            for naming_issue in analysis_results['naming_issues']:
-                file_path = naming_issue['path']
-                issues = naming_issue['issues']
-                task_desc = f"Rename: {os.path.basename(file_path)} ({', '.join(issues[:2])})"
-                task_id = self.add_background_task('rename', file_path, self.rename_file_task, task_desc)
-                rename_tasks.append(task_id)
-            print(f"✓ Queued {len(rename_tasks)} rename tasks")
-        
-        # Queue transcoding tasks if user requested them
-        if fix_transcoding and analysis_results['conversion_candidates']:
-            total_size_gb = sum(c['size_gb'] for c in analysis_results['conversion_candidates'])
-            print(f"\n🎬 Queueing {len(analysis_results['conversion_candidates'])} transcode tasks...")
-            print(f"Total size to process: {total_size_gb:.1f} GB")
-            for candidate in analysis_results['conversion_candidates']:
-                file_path = candidate['path']
-                task_desc = f"Transcode to 1080p: {os.path.basename(file_path)}"
-                self.add_background_task('transcode', file_path, self.transcode_video_task, task_desc)
-            print(f"✓ Queued {len(analysis_results['conversion_candidates'])} transcode tasks")
-        
-        # Queue container optimization tasks if user requested them
-        if optimize_streaming and analysis_results.get('container_issues'):
-            total_size_gb = sum(c['size_gb'] for c in analysis_results['container_issues'])
-            print(f"\n📦 Queueing {len(analysis_results['container_issues'])} container optimization tasks...")
-            print(f"Total size to optimize: {total_size_gb:.1f} GB")
-            for container_issue in analysis_results['container_issues']:
-                file_path = container_issue['path']
-                container = container_issue['container']
-                task_desc = f"Convert {container} to MP4: {os.path.basename(file_path)}"
-                self.add_background_task('optimize', file_path, self.optimize_container_task, task_desc)
-            print(f"✓ Queued {len(analysis_results['container_issues'])} container optimization tasks")
-        
-        # Queue subtitle downloads if user requested them
-        if fix_subtitles and analysis_results['missing_subtitles']:
-            print(f"\n📝 Queueing {len(analysis_results['missing_subtitles'])} subtitle download tasks...")
-            for file_path in analysis_results['missing_subtitles']:
-                task_desc = f"Download subtitles for {os.path.basename(file_path)}"
-                self.add_background_task('subtitle', file_path, self.download_subtitle_task, task_desc)
-            print(f"✓ Queued {len(analysis_results['missing_subtitles'])} subtitle download tasks")
-        
-        with self._progress_lock:
-            progress['resolution_analysis']['complete'] = True
-            progress['codec_analysis']['complete'] = True
-            progress['naming_analysis']['complete'] = True
-            progress['subtitle_check']['complete'] = True
-        
-        # Phase 3: Corruption checking (if enabled)
-        if check_corruption:
-            with self._progress_lock:
-                progress['corruption_check']['total'] = len(files_to_analyze)
+            # Check for large files
+            size_gb = stat.st_size / (1024**3)
+            if size_gb > 10:
+                analysis_results['large_files'].append({
+                    'path': file_path,
+                    'size_gb': size_gb
+                })
             
-            # Check for corruption on files that had analysis issues
-            corruption_candidates = []
-            for file_path in files_to_analyze:
-                # Only check files that might be problematic
-                if (file_path in [f['path'] for f in analysis_results['conversion_candidates']] or
-                    any(os.path.basename(file_path) in issue for issue in found_issues['codec_problems'])):
-                    corruption_candidates.append(file_path)
-            
-            for i, file_path in enumerate(corruption_candidates):
-                with self._progress_lock:
-                    progress['corruption_check']['current'] = i + 1
-                
-                # Queue corruption check as background task
-                if len(self.active_tasks) < self.max_concurrent_tasks:
-                    task_desc = f"Check integrity: {os.path.basename(file_path)}"
-                    self.add_background_task('corruption', file_path, self.check_video_corruption_task, task_desc)
-                
-                time.sleep(0.001 + secrets.SystemRandom().uniform(0, 0.0005))  # Cryptographically secure jitter
-        
-        with self._progress_lock:
-            progress['corruption_check']['complete'] = True
-        
-        # Wait for progress display to finish
-        time.sleep(1 + secrets.SystemRandom().uniform(0, 0.2))  # Add jitter to prevent timing attacks
-        
-        # Scan for system files with auto-remove option
-        print("\n🗑️  Scanning for system files...")
-        for root, dirs, files in os.walk(self.base_path, followlinks=False):
-            for file in files:
-                if file in ['.DS_Store', 'Thumbs.db', 'desktop.ini'] or file.startswith('._'):
-                    file_path = os.path.join(root, file)
-                    analysis_results['system_files'].append(file_path)
-                    found_issues['system_files_found'].append(f"System file: {os.path.relpath(file_path, self.base_path)}")
-                    
-                    # Auto-queue removal if enabled
-                    if auto_remove_system and len(self.active_tasks) < self.max_concurrent_tasks:
-                        task_desc = f"Remove system file: {file}"
-                        self.add_background_task('cleanup', file_path, self.remove_system_file_task, task_desc)
-        
-        # Process any queued background tasks
-        if not self.task_queue.empty():
-            self.process_background_tasks(found_issues)
-        
-        # Calculate analysis duration
-        analysis_duration = time.time() - start_time
-        
-        # Generate recommendations
+        except OSError:
+            pass
+    
+    def generate_recommendations(self, analysis_results):
+        """Generate prioritized recommendations based on analysis results."""
         recommendations = []
         
         if analysis_results['conversion_candidates']:
-            total_size = sum(f['size_gb'] for f in analysis_results['conversion_candidates'])
+            total_size = sum(c['size_gb'] for c in analysis_results['conversion_candidates'])
             recommendations.append({
                 'priority': 'HIGH',
-                'category': 'Storage Optimization',
-                'task': f"Convert {len(analysis_results['conversion_candidates'])} videos from 4K+ to 1080p",
+                'category': 'Storage',
+                'task': f"Convert {len(analysis_results['conversion_candidates'])} videos to 1080p",
                 'benefit': f"Could save ~{total_size * 0.6:.1f} GB of storage",
                 'action': 'Use Option 8: Convert videos to 1080p'
             })
@@ -7965,16 +8599,7 @@ class MediaManager:
                 'category': 'Compatibility',
                 'task': f"Convert {len(analysis_results['codec_issues'])} videos with old codecs",
                 'benefit': 'Improve playback compatibility and reduce file sizes',
-                'action': 'Use Option 16: Batch Operations → Codec Operations'
-            })
-        
-        if analysis_results['naming_issues']:
-            recommendations.append({
-                'priority': 'MEDIUM', 
-                'category': 'Organization',
-                'task': f"Fix naming issues in {len(analysis_results['naming_issues'])} files",
-                'benefit': 'Better Plex media server organization and metadata',
-                'action': 'Use Option 14: Smart Organization'
+                'action': 'Use Option 10: Batch Operations → Codec Operations'
             })
         
         if analysis_results['missing_subtitles']:
@@ -7983,41 +8608,43 @@ class MediaManager:
                 'category': 'Accessibility',
                 'task': f"Download subtitles for {len(analysis_results['missing_subtitles'])} videos",
                 'benefit': 'Better accessibility and viewing experience',
-                'action': 'Use Option 10: Download English subtitles'
-            })
-        
-        if analysis_results['system_files']:
-            recommendations.append({
-                'priority': 'LOW',
-                'category': 'Cleanup',
-                'task': f"Remove {len(analysis_results['system_files'])} system files",
-                'benefit': 'Clean up unnecessary system files',
-                'action': 'Use Option 11: Quick Fixes'
+                'action': 'Use Option 12: Download English subtitles'
             })
         
         analysis_results['recommendations'] = recommendations
-        
-        # Save analysis session to database
-        self.save_analysis_session(
-            len(all_video_files), 
-            len(files_to_analyze),
-            analysis_duration,
-            recommendations
-        )
-        
-        # Display results with background task info
-        self.display_analysis_results({
-            'session': {
-                'timestamp': time.time(),
-                'total_files': len(all_video_files),
-                'files_analyzed': len(files_to_analyze),
-                'duration_seconds': analysis_duration
-            },
-            'analysis_results': analysis_results,
-            'found_issues': found_issues,
-            'background_tasks_completed': len(self.completed_tasks)
-        })
     
+    def display_final_analysis_results(self, analysis_results, total_files, analyzed_files):
+        """Display final analysis results with recommendations."""
+        self.clear_screen()
+        print("="*60)
+        print("📊 Background Analysis Complete")
+        print("="*60)
+        
+        print(f"📁 Total Files: {total_files:,}")
+        print(f"🔍 Files Analyzed: {analyzed_files:,}")
+        print()
+        
+        # Summary statistics
+        print("📈 SUMMARY")
+        print("-" * 30)
+        print(f"Videos needing conversion: {len(analysis_results['conversion_candidates'])}")
+        print(f"Videos with codec issues: {len(analysis_results['codec_issues'])}")
+        print(f"Videos missing subtitles: {len(analysis_results['missing_subtitles'])}")
+        print(f"Large files (>10GB): {len(analysis_results['large_files'])}")
+        print(f"System files to clean: {len(analysis_results['system_files'])}")
+        
+        # Show recommendations
+        if analysis_results['recommendations']:
+            print(f"\n🎯 RECOMMENDATIONS")
+            print("-" * 30)
+            for i, rec in enumerate(analysis_results['recommendations'], 1):
+                print(f"{i}. {rec['task']} ({rec['priority']})")
+                print(f"   {rec['benefit']}")
+                print(f"   → {rec['action']}")
+                print()
+        
+        self.safe_input("Press Enter to continue...")
+
     def display_analysis_results(self, data):
         """Display analysis results from cached or fresh data."""
         self.clear_screen()
