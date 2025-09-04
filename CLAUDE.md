@@ -118,6 +118,8 @@ This is a comprehensive media library management system with a primary Python ap
 - **TMDB Integration**: Manual file correction with movie/TV database lookup for accurate Plex naming
 - **Automated Task Execution**: Full scans now execute all requested fixes (conversion, subtitles, etc.)
 - **Performance Optimization**: All size analysis operations use database queries for instant results
+- **Strict Authorization Control**: All file operations validate authorization before execution
+- **Database-Powered Conversion**: Video resolution scanning uses cached metadata for instant results
 
 ### Security Features
 
@@ -131,6 +133,7 @@ This is a comprehensive media library management system with a primary Python ap
 - **Information Disclosure Prevention**: Path and error message sanitization
 - **Cryptographic Security**: Secure random number generation for timing operations
 - **Performance Limits**: DoS protection with file count and directory depth limits
+- **Folder Authorization Control**: Strict validation prevents operations on unauthorized directories
 
 ### Workflow Recommendations
 
@@ -160,6 +163,7 @@ The application implements multiple layers of security protection:
 5. **Database Security**: Parameterized queries, secure file permissions (0600)
 6. **Error Sanitization**: All error messages scrubbed of sensitive system information
 7. **Audit Logging**: Security events logged for monitoring and compliance
+8. **Authorization Enforcement**: Strict file operation validation prevents unauthorized directory access
 
 ### Security Compliance
 

@@ -282,6 +282,9 @@ class MediaManager:
         
         self.init_database()
         
+        # Clean up database to only contain files from authorized folders
+        self.cleanup_unauthorized_files()
+        
         # Background task management with thread safety
         self.task_queue = queue.Queue()
         self.active_tasks = {}
@@ -427,6 +430,62 @@ class MediaManager:
                 self.security_audit_log("DB_PERMISSION_WARNING", f"Database permissions {current_perms} instead of 600")
         except OSError as e:
             print(f"Warning: Could not set secure permissions on database: {self.sanitize_error_message(str(e))}")
+    
+    def cleanup_unauthorized_files(self):
+        """Remove database entries for files not in authorized folders."""
+        with self.get_db_context() as conn:
+            cursor = conn.cursor()
+            
+            # Get authorized folders
+            cursor.execute('SELECT folder_path FROM folder_config WHERE enabled = 1')
+            authorized_folders = [row[0] for row in cursor.fetchall()]
+            
+            if not authorized_folders:
+                return  # No cleanup needed if no folders configured
+                
+            # Find files not in any authorized folder
+            cursor.execute('SELECT file_path FROM video_files')
+            all_files = cursor.fetchall()
+            
+            unauthorized_files = []
+            for (file_path,) in all_files:
+                is_authorized = any(file_path.startswith(folder) for folder in authorized_folders)
+                if not is_authorized:
+                    unauthorized_files.append(file_path)
+                    
+            if unauthorized_files:
+                print(f"🧹 Cleaning {len(unauthorized_files)} unauthorized files from database...")
+                # Remove unauthorized files from database
+                for file_path in unauthorized_files:
+                    cursor.execute('DELETE FROM video_files WHERE file_path = ?', (file_path,))
+                    
+                # Also clean up any orphaned manual corrections
+                cursor.execute('DELETE FROM manual_corrections WHERE original_file_path NOT IN (SELECT file_path FROM video_files)')
+                
+                self.security_audit_log("UNAUTHORIZED_FILES_CLEANUP", f"Removed {len(unauthorized_files)} unauthorized file entries from database")
+    
+    def is_file_authorized(self, file_path):
+        """Check if a file is in an authorized folder."""
+        with self.get_db_context() as conn:
+            cursor = conn.cursor()
+            cursor.execute('SELECT folder_path FROM folder_config WHERE enabled = 1')
+            authorized_folders = [row[0] for row in cursor.fetchall()]
+            
+        if not authorized_folders:
+            return False
+            
+        # Normalize the file path
+        normalized_path = os.path.abspath(file_path)
+        
+        # Check if file is under any authorized folder
+        for folder in authorized_folders:
+            normalized_folder = os.path.abspath(folder)
+            if normalized_path.startswith(normalized_folder + os.sep) or normalized_path == normalized_folder:
+                return True
+                
+        # Log unauthorized access attempt
+        self.security_audit_log("UNAUTHORIZED_FILE_ACCESS_BLOCKED", f"Blocked operation on: {self.sanitize_path_for_display(file_path)}")
+        return False
     
     def security_audit_log(self, operation, details=""):
         """Log security-relevant operations for audit purposes."""
@@ -1076,6 +1135,10 @@ class MediaManager:
     
     def safe_file_delete(self, file_path):
         """Safely delete file with comprehensive checks."""
+        # STRICT AUTHORIZATION CHECK
+        if not self.is_file_authorized(file_path):
+            return False, f"UNAUTHORIZED: Cannot delete file outside configured folders: {self.sanitize_path_for_display(file_path)}"
+            
         # Validate path is safe
         if not self.validate_safe_path(file_path):
             return False, "Unsafe file path"
@@ -2098,6 +2161,9 @@ class MediaManager:
     def download_subtitle_task(self, file_path):
         """Background task for downloading subtitles."""
         try:
+            # STRICT AUTHORIZATION CHECK
+            if not self.is_file_authorized(file_path):
+                return f"❌ UNAUTHORIZED: Cannot download subtitles for file outside configured folders"
             # Check if subliminal is available
             if not self.optional_deps.get('subliminal', False):
                 print(f"Subliminal not available for {self.sanitize_path_for_display(file_path)}")
@@ -2127,6 +2193,10 @@ class MediaManager:
     
     def remove_system_file_task(self, file_path):
         """Background task for removing system files."""
+        # STRICT AUTHORIZATION CHECK
+        if not self.is_file_authorized(file_path):
+            return f"❌ UNAUTHORIZED: Cannot remove file outside configured folders"
+            
         # Use safe deletion method
         success, message = self.safe_file_delete(file_path)
         if success:
@@ -2137,6 +2207,10 @@ class MediaManager:
     def check_video_corruption_task(self, file_path):
         """Background task for checking video file integrity."""
         try:
+            # STRICT AUTHORIZATION CHECK
+            if not self.is_file_authorized(file_path):
+                return f"❌ UNAUTHORIZED: Cannot check file outside configured folders: {self.sanitize_path_for_display(file_path)}"
+                
             # Quick integrity check using ffprobe
             cmd = [
                 'ffprobe',
@@ -2161,6 +2235,10 @@ class MediaManager:
     def rename_file_task(self, file_path):
         """Background task for renaming files to fix naming issues."""
         try:
+            # STRICT AUTHORIZATION CHECK
+            if not self.is_file_authorized(file_path):
+                return f"❌ UNAUTHORIZED: Cannot rename file outside configured folders: {self.sanitize_path_for_display(file_path)}"
+                
             if not os.path.exists(file_path):
                 return f"File not found: {file_path}"
                 
@@ -2211,6 +2289,10 @@ class MediaManager:
     def rename_file_task_no_db(self, file_path):
         """Rename file without database update (for batching)."""
         try:
+            # STRICT AUTHORIZATION CHECK
+            if not self.is_file_authorized(file_path):
+                return {'success': False, 'error': f"❌ UNAUTHORIZED: Cannot rename file outside configured folders: {self.sanitize_path_for_display(file_path)}"}
+                
             if not os.path.exists(file_path):
                 return {'success': False, 'error': f"File not found: {file_path}"}
                 
@@ -2260,6 +2342,10 @@ class MediaManager:
     def transcode_video_task(self, file_path):
         """Background task for transcoding videos to 1080p."""
         try:
+            # STRICT AUTHORIZATION CHECK
+            if not self.is_file_authorized(file_path):
+                return f"❌ UNAUTHORIZED: Cannot process file outside configured folders: {self.sanitize_path_for_display(file_path)}"
+                
             if not os.path.exists(file_path):
                 return f"File not found: {file_path}"
                 
@@ -2316,6 +2402,10 @@ class MediaManager:
     def optimize_container_task(self, file_path):
         """Background task for converting problematic containers to MP4."""
         try:
+            # STRICT AUTHORIZATION CHECK
+            if not self.is_file_authorized(file_path):
+                return f"❌ UNAUTHORIZED: Cannot optimize file outside configured folders: {self.sanitize_path_for_display(file_path)}"
+                
             if not os.path.exists(file_path):
                 return f"File not found: {file_path}"
                 
@@ -2508,16 +2598,31 @@ class MediaManager:
         """List videos that are candidates for conversion."""
         print("\nFinding conversion candidates from database...")
         
-        # Query database for conversion candidates
+        # Get authorized folders first
         with self.get_db_context() as conn:
             cursor = conn.cursor()
-            cursor.execute('''
+            cursor.execute('SELECT folder_path FROM folder_config WHERE enabled = 1')
+            authorized_folders = [row[0] for row in cursor.fetchall()]
+            
+        if not authorized_folders:
+            print("No folders authorized for scanning. Please configure folders first.")
+            self.safe_input("\nPress Enter to continue...")
+            return
+            
+        # Query database for conversion candidates only from authorized folders
+        with self.get_db_context() as conn:
+            cursor = conn.cursor()
+            folder_conditions = ' OR '.join(['file_path LIKE ?' for _ in authorized_folders])
+            folder_params = [f"{folder}%" for folder in authorized_folders]
+            
+            cursor.execute(f'''
                 SELECT file_path, filename, width, height, file_size, codec
                 FROM video_files
                 WHERE (width > 1920 OR height > 1080)
                 AND filename NOT LIKE '%-CONVERTED%'
+                AND ({folder_conditions})
                 ORDER BY file_size DESC
-            ''')
+            ''', folder_params)
             candidates = cursor.fetchall()
         
         if not candidates:
@@ -2727,15 +2832,30 @@ class MediaManager:
         """Show top 10 individual video files by size."""
         print("\nFinding top 10 largest video files from database...")
         
-        # Query database for largest files
+        # Get authorized folders first
         with self.get_db_context() as conn:
             cursor = conn.cursor()
-            cursor.execute('''
+            cursor.execute('SELECT folder_path FROM folder_config WHERE enabled = 1')
+            authorized_folders = [row[0] for row in cursor.fetchall()]
+            
+        if not authorized_folders:
+            print("No folders authorized for scanning. Please configure folders first.")
+            self.safe_input("\nPress Enter to continue...")
+            return
+            
+        # Query database for largest files only from authorized folders
+        with self.get_db_context() as conn:
+            cursor = conn.cursor()
+            folder_conditions = ' OR '.join(['file_path LIKE ?' for _ in authorized_folders])
+            folder_params = [f"{folder}%" for folder in authorized_folders]
+            
+            cursor.execute(f'''
                 SELECT file_path, filename, file_size, width, height, codec, duration
                 FROM video_files
+                WHERE {folder_conditions}
                 ORDER BY file_size DESC
                 LIMIT 10
-            ''')
+            ''', folder_params)
             videos = cursor.fetchall()
         
         if not videos:
@@ -3663,40 +3783,63 @@ class MediaManager:
                     self.safe_input("\nPress Enter to continue...")
                 
     def run_conversion_scan(self, target_resolution, target_width, target_height, directory=None):
-        """Run conversion scan for videos larger than target resolution."""
-        if directory is None:
-            directory = self.base_path
+        """Run conversion scan for videos larger than target resolution using database."""
+        print(f"Finding videos larger than {target_resolution}p from database...")
+        
+        # Get authorized folders first
+        with self.get_db_context() as conn:
+            cursor = conn.cursor()
+            cursor.execute('SELECT folder_path FROM folder_config WHERE enabled = 1')
+            authorized_folders = [row[0] for row in cursor.fetchall()]
             
-        # Direct method implementation - no temporary scripts
-        # Validate directory path first
-        if not self.validate_safe_path(directory):
-            print(f"Error: Invalid or unsafe directory path: {self.sanitize_path_for_display(directory)}")
+        if not authorized_folders:
+            print("No folders authorized for scanning. Please configure folders first.")
+            self.safe_input("\nPress Enter to continue...")
             return
         
-        print(f"Scanning for videos larger than {target_resolution}p...")
+        # Query database for conversion candidates from authorized folders only
         candidates = []
-        
-        for root, _, files in os.walk(directory, followlinks=False):
-            for file in files:
-                if "-CONVERTED" in file:
-                    continue
-                file_path = os.path.join(root, file)
-                if file.lower().endswith(('.mp4', '.mkv', '.avi', '.mov', '.flv')):
-                    width, height = self.get_video_resolution_safe(file_path)
-                    if width and height and (width > target_width or height > target_height):
-                        try:
-                            file_size_gb = os.path.getsize(file_path) / (1024 ** 3)
-                            candidates.append({
-                                'path': file_path,
-                                'width': width,
-                                'height': height,
-                                'size_gb': file_size_gb
-                            })
-                        except OSError:
-                            continue
+        with self.get_db_context() as conn:
+            cursor = conn.cursor()
+            
+            # Build directory filter conditions
+            if directory:
+                # Specific directory requested - ensure it's authorized
+                if not any(directory.startswith(folder) for folder in authorized_folders):
+                    print(f"Directory {self.sanitize_path_for_display(directory)} is not in authorized folders.")
+                    self.safe_input("\nPress Enter to continue...")
+                    return
+                directory_conditions = 'file_path LIKE ?'
+                directory_params = [f"{directory}%"]
+            else:
+                # Use all authorized folders
+                directory_conditions = ' OR '.join(['file_path LIKE ?' for _ in authorized_folders])
+                directory_params = [f"{folder}%" for folder in authorized_folders]
+            
+            cursor.execute(f'''
+                SELECT file_path, filename, width, height, file_size
+                FROM video_files
+                WHERE ({directory_conditions})
+                  AND filename NOT LIKE '%CONVERTED%'
+                  AND width IS NOT NULL 
+                  AND height IS NOT NULL
+                  AND (width > ? OR height > ?)
+                ORDER BY file_size DESC
+            ''', directory_params + [target_width, target_height])
+            
+            for row in cursor.fetchall():
+                file_path, filename, width, height, file_size = row
+                file_size_gb = file_size / (1024 ** 3)
+                candidates.append({
+                    'path': file_path,
+                    'width': width,
+                    'height': height,
+                    'size_gb': file_size_gb
+                })
         
         if not candidates:
-            print(f"\nNo videos found larger than {target_resolution}p.")
+            print(f"No videos found larger than {target_resolution}p.")
+            self.safe_input("\nPress Enter to continue...")
             return
         
         print(f"\nFound {len(candidates)} videos to convert:")
@@ -3707,10 +3850,7 @@ class MediaManager:
         if len(candidates) > 10:
             print(f"\n... and {len(candidates) - 10} more")
         
-        response = self.safe_input(f"\nConvert these videos to {target_resolution}p? (y/N): ")
-        if response.lower() != 'y':
-            print("Conversion cancelled.")
-            return
+        print(f"\n🚀 Starting conversion of {len(candidates)} videos to {target_resolution}p...")
         
         for i, video in enumerate(candidates, 1):
             print(f"\n[{i}/{len(candidates)}] Processing {video['path']}")
@@ -4912,15 +5052,28 @@ class MediaManager:
         """Find files that might need manual correction."""
         candidates = []
         
-        # Look through video files in database for potential issues
+        # Get authorized folders first
         with self.get_db_context() as conn:
             cursor = conn.cursor()
-            cursor.execute('''
+            cursor.execute('SELECT folder_path FROM folder_config WHERE enabled = 1')
+            authorized_folders = [row[0] for row in cursor.fetchall()]
+            
+        if not authorized_folders:
+            return []
+        
+        # Look through video files in database for potential issues (only authorized folders)
+        with self.get_db_context() as conn:
+            cursor = conn.cursor()
+            folder_conditions = ' OR '.join(['file_path LIKE ?' for _ in authorized_folders])
+            folder_params = [f"{folder}%" for folder in authorized_folders]
+            
+            cursor.execute(f'''
                 SELECT file_path, filename, naming_issues 
                 FROM video_files 
                 WHERE naming_issues IS NOT NULL AND naming_issues != ''
+                AND ({folder_conditions})
                 ORDER BY file_path
-            ''')
+            ''', folder_params)
             
             for file_path, filename, naming_issues in cursor.fetchall():
                 if os.path.exists(file_path):
